@@ -17,6 +17,7 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -242,6 +243,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._block_pos_offsets = build_block_pos_offsets(
             length=self.block_size, device=self.device
         )
+        # VLM drafts (interleaved mRoPE + partial rotary) need true mRoPE
+        # positions on every draft path; text drafts keep the flat-1D behavior.
+        first_rotary = (
+            self.draft_model.layers[0].self_attn.rotary_emb
+            if len(self.draft_model.layers) > 0
+            else None
+        )
+        self._draft_uses_mrope = isinstance(first_rotary, MRotaryEmbedding)
+        self._draft_block_mrope_buf: Optional[torch.Tensor] = (
+            None  # [3, cap_bs * block_size], only when _draft_uses_mrope
+        )
         self._draft_block_ids_buf: Optional[torch.Tensor] = None  # [cap_bs, block_size]
         self._draft_block_positions_buf: Optional[torch.Tensor] = (
             None  # [cap_bs, block_size]
@@ -456,6 +468,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                         f"layer={layer_idx}, rope_is_neox_style={rope_is_neox_style}"
                     )
                     break
+                if isinstance(attn.rotary_emb, MRotaryEmbedding):
+                    # The fused helper's rope cache is 1D/plain-rope only; mRoPE
+                    # drafts materialize through the per-layer MRotaryEmbedding
+                    # path, which accepts (3, N) positions with interleave.
+                    fused_disable_reason = (
+                        f"mRoPE draft uses the per-layer mrope rotary path: "
+                        f"layer={layer_idx}"
+                    )
+                    break
 
             if fused_disable_reason is not None:
                 if self.ps.tp_rank == 0:
@@ -514,6 +535,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_block_positions_buf = torch.empty(
             (new_cap, block_size), dtype=torch.int64, device=device
         )
+        if self._draft_uses_mrope and (
+            self._draft_block_mrope_buf is None
+            or int(self._draft_block_mrope_buf.shape[1]) < new_cap * block_size
+        ):
+            self._draft_block_mrope_buf = torch.empty(
+                (3, new_cap * block_size), dtype=torch.int64, device=device
+            )
         self._draft_block_tokens_buf = torch.empty(
             (new_cap, block_size), dtype=torch.long, device=device
         )
@@ -1013,6 +1041,76 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         return out_tokens
 
+    def _request_mrope_delta_tensor(
+        self, batch: ScheduleBatch, bs: int, device: torch.device
+    ) -> torch.Tensor:
+        """Per-request mRoPE delta (true_pos - seq_pos), zeros for text-only.
+
+        Mirrors ``ForwardBatch.compute_spec_mrope_positions``: the target model
+        derives decode positions as ``seq_pos + delta`` broadcast over the
+        three mRoPE rows, and the DFlash draft reuses the same convention.
+        """
+        mm_inputs = list(getattr(batch, "multimodal_inputs", None) or [])
+        deltas = []
+        for i in range(bs):
+            mm_input = mm_inputs[i] if i < len(mm_inputs) else None
+            delta = None if mm_input is None else mm_input.mrope_position_delta
+            if delta is None:
+                deltas.append(torch.zeros(1, dtype=torch.int64))
+            else:
+                deltas.append(delta.reshape(-1)[:1].to(torch.int64))
+        return torch.stack(deltas, dim=0).to(device=device)
+
+    def _maybe_build_mrope_ctx_positions(
+        self,
+        *,
+        batch: ScheduleBatch,
+        prefix_lens: torch.Tensor,
+        extend_lens: torch.Tensor,
+        fallback_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """True mRoPE positions (3, N) for prefill context materialization.
+
+        Image-bearing requests contribute the processor-computed mRoPE rows
+        (sliced to the extend span, so radix-cache prefix hits stay aligned);
+        text-only requests contribute their flat positions broadcast over the
+        three rows. Returns the 1D fallback unchanged for non-mRoPE drafts.
+        """
+        if not self._draft_uses_mrope:
+            return fallback_positions
+
+        mm_inputs = list(getattr(batch, "multimodal_inputs", None) or [])
+        if not any(
+            mm_input is not None and mm_input.mrope_positions is not None
+            for mm_input in mm_inputs
+        ):
+            return fallback_positions.unsqueeze(0).expand(3, -1).contiguous()
+
+        starts = prefix_lens.to("cpu", dtype=torch.int64).tolist()
+        lens = extend_lens.to("cpu", dtype=torch.int64).tolist()
+        rows = []
+        for i, (start, length) in enumerate(zip(starts, lens)):
+            start, length = int(start), int(length)
+            mm_input = mm_inputs[i] if i < len(mm_inputs) else None
+            mrope_positions = None if mm_input is None else mm_input.mrope_positions
+            if mrope_positions is not None:
+                if mrope_positions.ndim != 2 or mrope_positions.shape[0] != 3:
+                    raise RuntimeError(
+                        "DFLASH expected request mrope_positions of shape (3, L), "
+                        f"got {tuple(mrope_positions.shape)} for batch index {i}."
+                    )
+                if int(mrope_positions.shape[1]) < start + length:
+                    raise RuntimeError(
+                        "DFLASH mrope_positions shorter than the extend span: "
+                        f"have {int(mrope_positions.shape[1])}, need {start + length} "
+                        f"(batch index {i})."
+                    )
+                rows.append(mrope_positions[:, start : start + length])
+            else:
+                flat = torch.arange(start, start + length, dtype=torch.int64)
+                rows.append(flat.unsqueeze(0).expand(3, -1))
+        return torch.cat(rows, dim=1).to(device=self.device, dtype=torch.int64)
+
     def _append_target_hidden_to_draft_kv_by_loc(
         self,
         *,
@@ -1042,9 +1140,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             raise ValueError(
                 f"DFLASH cache_loc must be 1D, got shape={tuple(cache_loc.shape)}."
             )
-        if positions.ndim != 1:
+        if positions.ndim not in (1, 2) or (
+            positions.ndim == 2 and positions.shape[0] != 3
+        ):
             raise ValueError(
-                f"DFLASH positions must be 1D, got shape={tuple(positions.shape)}."
+                "DFLASH positions must be 1D (text) or (3, N) mRoPE rows, "
+                f"got shape={tuple(positions.shape)}."
             )
         num_tokens = int(target_hidden.shape[0])
         if int(cache_loc.numel()) != num_tokens:
@@ -1052,10 +1153,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                 "DFLASH cache_loc length mismatch: "
                 f"cache_loc={int(cache_loc.numel())}, target_hidden={num_tokens}."
             )
-        if int(positions.numel()) != num_tokens:
+        num_position_tokens = (
+            int(positions.shape[1]) if positions.ndim == 2 else int(positions.numel())
+        )
+        if num_position_tokens != num_tokens:
             raise ValueError(
                 "DFLASH positions length mismatch: "
-                f"positions={int(positions.numel())}, target_hidden={num_tokens}."
+                f"positions={num_position_tokens}, target_hidden={num_tokens}."
             )
         if cache_loc_2d is not None:
             if cache_loc_2d.ndim != 2:
@@ -1181,7 +1285,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
                 layer, ctx_hidden
             )
-            if _is_npu:
+            if attn.use_fused_npu_prepare():
                 _, k, v = attn.forward_prepare_npu(ctx_positions, layer_ctx_hidden)
             else:
                 k, v = attn.kv_proj_only(layer_ctx_hidden)
@@ -1333,7 +1437,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         ]
         self._accept_bonus_buffer_cap = new_cap
 
-    def _next_accept_bonus_buffers(self, bs: int) -> tuple[
+    def _next_accept_bonus_buffers(
+        self, bs: int
+    ) -> tuple[
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
@@ -1439,6 +1545,12 @@ class DFlashWorkerV2(BaseSpecWorker):
                 draft_seq_lens,
                 ctx_lens,
                 int(sum(batch.extend_lens)),
+            )
+            positions = self._maybe_build_mrope_ctx_positions(
+                batch=batch,
+                prefix_lens=draft_seq_lens,
+                extend_lens=ctx_lens,
+                fallback_positions=positions,
             )
             self._append_target_hidden_to_draft_kv_by_loc(
                 target_hidden=logits_output.hidden_states,
@@ -1577,6 +1689,19 @@ class DFlashWorkerV2(BaseSpecWorker):
         positions = positions_2d.reshape(-1)
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
 
+        # mRoPE drafts: decode-block true positions = flat position + per-request
+        # delta (same convention as the target's spec mrope path), broadcast to
+        # (3, N) rows into a static buffer so CUDA-graph replay reads fresh values.
+        mrope_positions = None
+        if self._draft_uses_mrope:
+            mrope_deltas = self._request_mrope_delta_tensor(batch, bs, device)
+            mrope_block = (positions_2d + mrope_deltas).reshape(-1)
+            assert self._draft_block_mrope_buf is not None
+            mrope_positions = self._draft_block_mrope_buf[:, : bs * block_size]
+            mrope_positions[0].copy_(mrope_block)
+            mrope_positions[1].copy_(mrope_block)
+            mrope_positions[2].copy_(mrope_block)
+
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
         if self.use_compact_draft_cache:
             # Rebuild the draft-local sliding-window view from committed target state.
@@ -1625,6 +1750,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             seq_lens_sum=draft_seq_lens_sum,
             seq_lens_cpu=seq_lens_cpu,
             positions=positions,
+            mrope_positions=mrope_positions,
             input_embeds=input_embeds,
             spec_algorithm=SpeculativeAlgorithm.DFLASH,
             spec_info=self._draft_block_spec_info,
@@ -1836,7 +1962,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
             cache_loc=verify_out_cache_loc,
             cache_loc_2d=verify_out_cache_loc_2d,
-            positions=positions,
+            positions=mrope_positions if mrope_positions is not None else positions,
             commit_lens=commit_lens,
         )
 

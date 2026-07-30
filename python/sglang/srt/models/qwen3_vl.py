@@ -1449,7 +1449,13 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 "DFLASH requires explicit layer_ids for aux hidden capture."
             )
         self.capture_aux_hidden_states = True
-        self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
+        if hasattr(self.model, "set_dflash_layers_to_capture"):
+            self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
+        else:
+            # Dense VLM text stacks (Qwen3LLMModel -> Qwen3Model -> Qwen2Model)
+            # have no setter but consume `layers_to_capture` in forward; assign
+            # it directly with the same "capture before layer k + 1" shift.
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

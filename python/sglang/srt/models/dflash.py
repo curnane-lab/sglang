@@ -24,6 +24,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
@@ -139,6 +140,17 @@ class DFlashAttention(nn.Module):
             )
         )
         max_position_embeddings = int(getattr(config, "max_position_embeddings", 32768))
+        # VLM-family drafts (Qwen3.5 / Qwen3.6) rotate only a fraction of each
+        # head dim (partial_rotary_factor=0.25) and use interleaved mRoPE
+        # sections; both are driven by the draft config's rope dict. Text
+        # drafts keep partial_rotary_factor=1.0 and a plain rope_scaling, so
+        # this is a no-op for them.
+        partial_rotary_factor = getattr(config, "partial_rotary_factor", None)
+        if partial_rotary_factor is None and rope_scaling:
+            partial_rotary_factor = rope_scaling.get("partial_rotary_factor", None)
+        partial_rotary_factor = float(
+            partial_rotary_factor if partial_rotary_factor is not None else 1.0
+        )
         self.rotary_emb = get_rope(
             head_dim,
             rotary_dim=head_dim,
@@ -146,6 +158,7 @@ class DFlashAttention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
             is_neox_style=rope_is_neox_style,
+            partial_rotary_factor=partial_rotary_factor,
         )
 
         self.scaling = head_dim**-0.5
@@ -182,19 +195,40 @@ class DFlashAttention(nn.Module):
         )
         return q, k, v
 
+    def use_fused_npu_prepare(self) -> bool:
+        """Whether the fused split_qkv_rmsnorm_rope NPU kernel is safe here.
+
+        That kernel assumes cos/sin width == head_dim and rotates the full
+        head, which is incompatible with partial-rotary mRoPE drafts (e.g.
+        Qwen3.5 with factor 0.25); those take the device-agnostic path
+        (MRotaryEmbedding handles partial dims and (3, N) positions natively).
+        """
+        return _is_npu and not (
+            isinstance(self.rotary_emb, MRotaryEmbedding)
+            and self.rotary_emb.rotary_dim < self.head_dim
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        # mRoPE drafts receive true multimodal positions through the forward
+        # batch (the worker keeps `positions` 1D for backend planning).
+        rope_positions = positions
+        fb_mrope_positions = getattr(forward_batch, "mrope_positions", None)
+        if fb_mrope_positions is not None and isinstance(
+            self.rotary_emb, MRotaryEmbedding
+        ):
+            rope_positions = fb_mrope_positions
         qkv, _ = self.qkv_proj(hidden_states)
-        if _is_npu:
-            q, k, v = self.forward_prepare_npu(positions, hidden_states)
+        if self.use_fused_npu_prepare():
+            q, k, v = self.forward_prepare_npu(rope_positions, hidden_states)
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             q, k = apply_qk_norm(q, k, self.q_norm, self.k_norm, self.head_dim)
-            q, k = self.rotary_emb(positions, q, k)
+            q, k = self.rotary_emb(rope_positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
         attn_output = self.apply_attention_output(attn_output, hidden_states)
         output, _ = self.o_proj(attn_output)
