@@ -1159,6 +1159,10 @@ class Req(ReqDllmMixin):
         # match, it will be the tracked seqlen in the ping pong buffer for the
         # right prefill pass.
         self.mamba_branching_seqlen: Optional[int] = None
+        # API-layer semantic boundaries (tool call / thinking block token
+        # offsets) extracted by the tokenizer manager. Used as preferred mamba
+        # checkpoint anchors inside the current extend window.
+        self.semantic_anchor_offsets: Optional[List[int]] = None
         # Total cached prefix length (on-device prefix_indices + host_hit_length),
         # capped at the max allowed prefix. Set during prefix matching at schedule
         # time and used to estimate uncached tokens / sort by longest prefix for
@@ -3031,6 +3035,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # See _force_track_h() for more details.
                     mamba_track_seqlen = _force_track_h(req.mamba_branching_seqlen)
                     mamba_track_seqlen_aligned = req.mamba_branching_seqlen
+            elif req.semantic_anchor_offsets:
+                # Prefer an API-layer semantic boundary (tool call / thinking
+                # block) as this window's mamba checkpoint anchor, so agent
+                # context edits recompute from the edit point instead of the
+                # last chunk-grid line. Same alignment contract as the
+                # branching path above (_force_track_h requires it).
+                for anchor in reversed(req.semantic_anchor_offsets):
+                    if (
+                        prefix_len < anchor < mamba_track_seqlen
+                        and (anchor - prefix_len) % cache_chunk_size == 0
+                    ):
+                        mamba_track_seqlen = _force_track_h(anchor)
+                        mamba_track_seqlen_aligned = anchor
+                        break
             req.kv.mamba_last_track_seqlen = mamba_track_seqlen_aligned
 
         return _MambaRadixCacheV2TrackEntry(
