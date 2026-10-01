@@ -24,30 +24,22 @@ This brings SGLang to parity with the reference vLLM implementation (vllm-ascend
 
 ### What's included
 
-**Feature (`8d19016e`)**
+Single commit `e773c4a1d9` (squashed after review; replaces the earlier 3-commit series):
 
-- `SpeculativeAlgorithm.MAMBA_ATTN_HYBRID` + server-args hook (`_handle_mamba_attn_hybrid`): PP!=1 / DP-attention / CP rejected, verify block size inferred from the speculators draft config (`speculative_tokens + 1`) unless set explicitly, overlap/`max_running_requests` defaults aligned with the dflash family.
-- Draft model `MambaAttnHybridDraftModel` (`models/hspec_draft.py`): block-pattern-driven Mamba-2 / attention / MLP hybrid stack.
-  - Draft attention sub-layers are `DFlashAttention` (RadixAttention over the draft KV pool); the context prefix K/V are materialized from the *target* paged KV pool at `attn_kv_layer_ids` (post-RoPE) — the semantics the drafter was trained with.
-  - The Mamba mixer uses a reference SSD scan in fp32 (no `mamba_ssm` dependency), which also makes it the correct kernel on Ascend NPU.
-  - Draft vocab head (`draft_vocab_size=32000`) with target-vocab offset mapping and the optional Markov bias head.
-- Worker `HSpecWorkerV2` (`speculative/hspec_worker_v2.py`): draft sampling from the infill mask positions (rows `1..K-1`) through the draft vocab head, and greedy verify against the target.
-- Latent-seed plumbing: target last-position hidden states → `fc` → `hidden_norm` → per-sublayer seed projections (config: `latent_fusion_layer_ids`, `attn_kv_layer_ids`, `fc_norm=false`, `mask_token_id`).
+**Feature**
 
-**Bring-up fixes (`0fccb532`)**
+- `SpeculativeAlgorithm.MAMBA_ATTN_HYBRID`, registered in the dflash **family** (`is_dflash_family`) — this also makes the NPU TARGET_VERIFY path skip the verify-block seq_len increment that non-dflash algorithms need (the dflash worker already publishes `seq_lens_cpu` as `prefix + block_size`; incrementing again made FIA attend `block_size` stale slots past the real KV and corrupted row-0 predictions).
+- Server-args hook `_handle_mamba_attn_hybrid`: verify block size inferred from the speculators draft config (`speculative_tokens + 1`), resolution writes via `declare_resolution`; PP/DP-attention/CP and `--speculative-draft-window-size` rejected.
+- Draft model `MambaAttnHybridDraftModel` (`models/hspec_draft.py`): block-pattern Mamba-2 / attention / MLP hybrid stack.
+  - Draft attention sub-layers reuse the *target* paged KV pool at `attn_kv_layer_ids` (post-RoPE), with a GQA/TP layout fail-fast check on the copied K/V.
+  - The Mamba mixer uses a reference SSD scan in fp32 (no `mamba_ssm` dependency) — also the correct kernel on Ascend NPU.
+  - Draft vocab head (`draft_vocab_size=32000`) with target-vocab offset mapping and the optional Markov bias head; latent-seed plumbing (`fc` → `hidden_norm` → per-sublayer seed projections).
+- Worker `HSpecWorkerV2`: draft sampling from the infill rows (`1..K-1`) through the draft-vocab head; greedy verify against the target.
 
-- Register `MAMBA_ATTN_HYBRID` in `SpeculativeAlgorithm` (previously `from_string` failed).
-- `candidate_selector` is optional — the H-Spec drafter has none.
-- `set_block_size` override (the hybrid stack has no DFLASH conv sublayers) and checkpoint compatibility (`fc_norm=false`).
-- Align `_sample_draft_next` signature with the base class and sample draft ids from the **mask positions (rows `1..K-1`, DFLASH infill convention)**; the previous rows `0..K-2` convention broke first-position hits (first-hit rate went from ~0% to ~100% after the fix).
-- Refresh rotary phases in every draft attention sublayer: each sublayer owns its `rotary_emb` instance and the `layer_id == 0` guard left later sublayers with stale cos/sin buffers.
-- **NPU eager-path fix: TARGET_VERIFY KV-length double count.** DFLASH verify pre-expands `batch.seq_lens_cpu` to `committed_prefix + block_size`, and the eager backend added `spec_tokens_per_req` again, so FIA received `kv_end = prefix + 2*block_size`. With bottom-right aligned causal, row 0 of each verify group then attended the whole verify block's own KV (corrupting its prediction), while later rows only saw zero-filled stale slots past the real KV — which masked the bug. The graph path already had the `_is_dflash_verify` guard; this adds the same treatment to the eager path.
+**Enforced restrictions**
 
-**Rebase adaptations (`012b26e1`, onto current main)**
-
-- `_handle_mamba_attn_hybrid` no longer assigns `server_args` directly during resolution; uses `resolving_view` reads + `declare_resolution` writes, matching `_handle_dflash`.
-- Draft-worker constructor drops the removed `ps` argument.
-- `MambaAttnHybridDraftModel` defines the attributes the shared dflash-family worker reads on any drafter (`candidate_selector` / `lilicorr` / `is_nemotron_35_draft` / `embed_tokens` / `prefix_gru` / `embed_proj` / `shift_label` / `lm_head`) and implements `project_target_hidden` / `prepare_context_hidden_for_kv` for the shared target-hidden materialization path.
+- Draft CUDA graph is disabled for `MAMBA_ATTN_HYBRID`: the dflash folded sampler samples the *target* lm_head over captured state, while H-Spec must sample its draft-vocab head over per-step latent seeds that are not captured (warning logged). The draft runs eager.
+- Greedy drafter sampling only; lossless serving requires `temperature=0`.
 
 ### Validation (Ascend 910, single card, eager, bf16, greedy, batch-1 sequential)
 
