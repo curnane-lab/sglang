@@ -24,7 +24,7 @@ This brings SGLang to parity with the reference vLLM implementation (vllm-ascend
 
 ### What's included
 
-Single commit `e773c4a1d9` (squashed after review; replaces the earlier 3-commit series):
+Single commit `9e7ae0d593` (squashed after review; replaces the earlier 3-commit series):
 
 **Feature**
 
