@@ -1211,7 +1211,7 @@ class CandidateSelector(nn.Module):
         """Walk one path, with q over the K candidates for the verify. greedy_mask
         rows take the argmax, selected rather than branched, so one captured graph
         serves greedy and sampling batches alike."""
-        if scores.is_cuda:
+        if scores.is_cuda and not _is_npu:
             return selector_walk_triton(
                 candidate_ids=candidate_ids,
                 scores=scores,
