@@ -148,7 +148,7 @@ class TargetVerifyExecutor:
         gamma: int,
         verify_num_draft_tokens: int,
         model_runner,
-        kv_injector: TargetHiddenKvInjector,
+        kv_injector: Optional[TargetHiddenKvInjector] = None,
         tp_sync: SpecTpSync,
         verify_epilogue=None,
         simulate_acc_len: float = 0.0,
@@ -390,6 +390,7 @@ class TargetVerifyExecutor:
         bs: int,
         run_compact: bool,
     ) -> None:
+        assert self.kv_injector is not None, "commit_hidden needs a kv_injector"
         if run_compact:
             self.kv_injector.inject_ragged(
                 batch=batch,
@@ -479,16 +480,29 @@ class TargetVerifyExecutor:
         verify_window: VerifyWindow,
         inject_gate: bool = False,
     ) -> tuple[TargetVerifyResult, torch.Tensor]:
-        ragged_window = BuildRaggedVerifyWindow.execute(
-            batch=batch,
-            layout=layout,
-            draft_block_ids=draft_block_ids,
-            draft_tokens=draft_tokens,
-            bs=bs,
-            device=device,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            model_runner=self.model_runner,
-        )
+        stride = self.verify_num_draft_tokens
+        full_block = layout.is_full_block(stride)
+        if full_block:
+            # Nothing to pack: the verify rows are the verify window.
+            ragged_window = RaggedVerifyWindow(
+                positions=verify_window.positions_2d.reshape(-1),
+                verify_cache_loc=verify_window.verify_cache_loc,
+                verify_ids=torch.cat((draft_block_ids[:, :1], draft_tokens), dim=1)
+                .reshape(-1)
+                .to(torch.int64),
+                window_index=None,
+            )
+        else:
+            ragged_window = BuildRaggedVerifyWindow.execute(
+                batch=batch,
+                layout=layout,
+                draft_block_ids=draft_block_ids,
+                draft_tokens=draft_tokens,
+                bs=bs,
+                device=device,
+                verify_num_draft_tokens=stride,
+                model_runner=self.model_runner,
+            )
         if self.verify_epilogue is not None:
             self.verify_epilogue.begin_step(layout.verify_lens, armed=inject_gate)
         target_verify = self._run_ragged(
@@ -500,7 +514,6 @@ class TargetVerifyExecutor:
         )
         logits_output = target_verify.logits_output
 
-        stride = self.verify_num_draft_tokens
         if self.verify_epilogue is not None and target_verify.can_run_cuda_graph:
             strided_logits = self.verify_epilogue.strided_logits
             hidden_strided = self.verify_epilogue.strided_hidden
@@ -512,23 +525,26 @@ class TargetVerifyExecutor:
             hidden_strided = hidden_strided[: bs * stride]
         else:
             compact_logits = logits_output.next_token_logits
-            strided_logits = ScatterCompactToStrided.execute(
-                compact=compact_logits,
-                layout=layout,
-                fill_value=0.0,
-                verify_num_draft_tokens=stride,
-            )
             compact_hidden = logits_output.hidden_states
             if compact_hidden is None:
                 raise RuntimeError(
                     "DSpark verify requires target hidden states, got None."
                 )
-            hidden_strided = ScatterCompactToStrided.execute(
-                compact=compact_hidden,
-                layout=layout,
-                fill_value=0.0,
-                verify_num_draft_tokens=stride,
-            )
+            if full_block:
+                strided_logits, hidden_strided = compact_logits, compact_hidden
+            else:
+                strided_logits = ScatterCompactToStrided.execute(
+                    compact=compact_logits,
+                    layout=layout,
+                    fill_value=0.0,
+                    verify_num_draft_tokens=stride,
+                )
+                hidden_strided = ScatterCompactToStrided.execute(
+                    compact=compact_hidden,
+                    layout=layout,
+                    fill_value=0.0,
+                    verify_num_draft_tokens=stride,
+                )
         apply_logits_adjustments_strided(
             next_token_logits=strided_logits,
             sampling_info=sampling_info,
@@ -984,7 +1000,7 @@ class DsparkVerifyEpilogue:
             and buf.shape[1] == compact.shape[1]
         ):
             return buf
-        assert not torch.cuda.is_current_stream_capturing(), (
+        assert not torch.get_device_module().is_current_stream_capturing(), (
             "DsparkVerifyEpilogue output buffers must be allocated during "
             "warmup, not inside graph capture (pool memory is unreadable "
             "post-replay)."

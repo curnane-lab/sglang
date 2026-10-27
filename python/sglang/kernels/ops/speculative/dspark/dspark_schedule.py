@@ -15,10 +15,14 @@ if TYPE_CHECKING:
         DSparkScheduleConfig,
     )
 
+from sglang.srt.utils import is_npu
+
 
 class ScheduleVerifyLensTopk:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
+        if is_npu():
+            return cls.torch(*args, **kwargs)
         if inputs_on_cuda(*args, **kwargs):
             return cls.triton(*args, **kwargs)
         return cls.torch(*args, **kwargs)
@@ -232,8 +236,12 @@ def schedule_verify_lens_topk_triton(
         G_P2=triton.next_power_of_2(max(gamma, 1)),
     )
     if budget > 0 and n > 0:
-        BLOCK_C = 64
-        BLOCK_CP = 256
+        if confidence.device.type == "npu":
+            BLOCK_C = 32
+            BLOCK_CP = 128
+        else:
+            BLOCK_C = 64
+            BLOCK_CP = 256
         grid = (triton.cdiv(n, BLOCK_C),)
         _schedule_topk_selected_extra_kernel[grid](
             survival,
