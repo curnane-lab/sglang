@@ -1,7 +1,6 @@
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra import libdevice
 
 
 @triton.jit
@@ -30,7 +29,7 @@ def softcap_inplace_logits_kernel(
 
     if APPLY_SOFTCAP:
         x = x / softcapping_value
-        x = libdevice.tanh(x)
+        x = (1.0 - 2.0 / (tl.exp(2.0 * x) + 1.0))
         x = x * softcapping_value
 
     # Store result
@@ -43,22 +42,27 @@ def softcap_inplace_logits_kernel(
 def _softcap_logits(full_logits, final_logit_softcapping, output=None):
     if output is not None:
         assert output.shape == full_logits.shape and output.dtype == torch.float32
-    if full_logits.is_contiguous() and (output is None or output.is_contiguous()):
+    if full_logits.ndim == 1:
         nrows, ncols = 1, full_logits.numel()
         row_stride = ncols
     else:
-        assert full_logits.ndim == 2, "non-contiguous softcap requires 2D tensor"
-        assert full_logits.stride(1) == 1, (
+        assert full_logits.ndim == 2 or full_logits.is_contiguous(), (
+            "non-contiguous softcap requires 2D tensor"
+        )
+        assert full_logits.stride(-1) == 1, (
             "non-contiguous softcap requires contiguous columns"
         )
-        nrows, ncols = full_logits.shape
-        row_stride = full_logits.stride(0)
+        ncols = full_logits.shape[-1]
+        nrows = full_logits.numel() // ncols
+        row_stride = full_logits.stride(-2)
         if output is not None:
-            assert output.stride(1) == 1 and (
-                nrows <= 1 or output.stride(0) >= ncols
+            assert output.stride(-1) == 1 and (
+                nrows <= 1 or output.stride(-2) >= ncols
             ), "softcap output requires contiguous, non-overlapping rows"
 
     BLOCK_SIZE = 1024
+    while ((ncols + BLOCK_SIZE - 1) // BLOCK_SIZE) * nrows > 65535:
+        BLOCK_SIZE *= 2
     grid = ((ncols + BLOCK_SIZE - 1) // BLOCK_SIZE, nrows)
 
     softcap_inplace_logits_kernel[grid](
@@ -68,7 +72,7 @@ def _softcap_logits(full_logits, final_logit_softcapping, output=None):
         row_stride=row_stride,
         BLOCK_SIZE=BLOCK_SIZE,
         output_ptr=output,
-        output_row_stride=(ncols if nrows == 1 else output.stride(0))
+        output_row_stride=(ncols if output.ndim == 1 else output.stride(-2))
         if output is not None
         else 0,
         CAST_TO_FP32=output is not None,
@@ -114,7 +118,7 @@ def _gathered_softcap_logits_kernel(
         mask=mask,
     )
     x = x / softcapping_value
-    x = libdevice.tanh(x)
+    x = (1.0 - 2.0 / (tl.exp(2.0 * x) + 1.0))
     x = x * softcapping_value
     tl.store(output_ptr + row * output_row_stride + cols, x, mask=mask)
 
