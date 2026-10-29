@@ -544,14 +544,8 @@ def scatter_compact_to_strided_into(
             device=compact.device,
         )
         bs = verify_lens.numel()
-        strided_pos = torch.where(
-            valid,
-            req_id.clamp(max=bs - 1) * stride + within,
-            torch.zeros_like(within),
-        )
-        previous = out.index_select(0, strided_pos)
-        values = torch.where(valid.unsqueeze(1), compact, previous)
-        out.index_copy_(0, strided_pos, values)
+        strided_pos = req_id.clamp(max=bs - 1) * stride + within
+        out.index_copy_(0, strided_pos[valid], compact[valid])
         return out
     start = (torch.cumsum(verify_lens, dim=0) - verify_lens).contiguous()
     n_out = out.shape[0]

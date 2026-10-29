@@ -91,6 +91,62 @@ def test_replay_updates_sequence_lengths_and_slices_logits_to_raw_batch():
     torch.testing.assert_close(output.hidden_states, torch.tensor([[0.0], [1.0]]))
 
 
+def test_dflash_hybrid_verify_uses_full_attention_kv_lengths():
+    runner = mod.NPUGraphRunner.__new__(mod.NPUGraphRunner)
+    runner.captured_req_width = 8
+    runner.model_runner = SimpleNamespace(
+        spec_algorithm=SimpleNamespace(is_dflash=lambda: True),
+        model_config=SimpleNamespace(
+            hf_config=object(), attention_arch=mod.AttentionArch.MHA
+        ),
+    )
+    full_attention = SimpleNamespace(
+        forward_metadata=SimpleNamespace(seq_lens_cpu_list=[102, 206])
+    )
+    attention = SimpleNamespace(full_attn_backend=full_attention)
+    runner._replay_attn_backend = lambda: attention
+    runner._replay_graph_key = ("graph", 16)
+    runner.backend = SimpleNamespace(
+        replay_with_input_update=mock.Mock(
+            return_value=LogitsProcessorOutput(
+                next_token_logits=torch.zeros(16, 1, dtype=torch.float32)
+            )
+        )
+    )
+    runner.is_dllm = False
+    runner.if_use_v2 = False
+    runner.use_fias_v2_bsnd = False
+    runner.ragged_verify_mode = False
+    runner.capture_forward_mode = SimpleNamespace(is_target_verify=lambda: True)
+    runner._init_arch_map()
+
+    def load_batch(forward_batch, pp_proxy_tensors):
+        runner.raw_bs = 2
+        runner.bs = 2
+        runner.raw_num_token = 16
+
+    runner.load_batch = load_batch
+    forward_batch = SimpleNamespace(
+        needs_forward_metadata_init=lambda: True,
+        spec_info=SimpleNamespace(ragged_verify_layout=None),
+        seq_lens_cpu=torch.tensor([102, 206], dtype=torch.int32),
+        forward_mode=SimpleNamespace(is_target_verify=lambda: True),
+    )
+
+    with (
+        mock.patch.object(mod, "is_deepseek_dsa", return_value=False),
+        mock.patch.object(mod, "is_deepseek_v4", return_value=False),
+    ):
+        runner.execute(forward_batch)
+
+    runner.backend.replay_with_input_update.assert_called_once_with(
+        ("graph", 16),
+        seq_lens=[102, 206],
+        attr_name="actual_seq_lengths_kv",
+        attr_type=runner._get_update_attr_type(),
+    )
+
+
 def test_ragged_non_mla_verify_uses_v2_kv_update_key():
     runner = mod.NPUGraphRunner.__new__(mod.NPUGraphRunner)
     runner.if_use_v2 = False

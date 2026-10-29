@@ -180,15 +180,15 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
             )
             self.state_indices_list_gdn[bs - 1].copy_(ssm_state_indices)
             if ragged_layout is not None:
-                if ragged_layout.bs != bs or ragged_layout.cap is None:
-                    ragged_layout = ragged_layout.padded_to_bucket(
-                        padded_bs=bs, cap=spec_info.draft_token_num
-                    )
-                self.query_start_loc_list[bs - 1].copy_(ragged_layout.qo_indptr_device)
+                real_bs = bs - num_padding
+                query_start_loc = self.query_start_loc_list[bs - 1]
+                query_start_loc[: real_bs + 1].copy_(
+                    ragged_layout.qo_indptr_device[: real_bs + 1]
+                )
                 if num_padding:
-                    query_start_loc = self.query_start_loc_list[bs - 1]
-                    real_token_total = query_start_loc[bs - num_padding].clone()
-                    query_start_loc[bs - num_padding :].copy_(real_token_total)
+                    query_start_loc[real_bs:].copy_(
+                        ragged_layout.qo_indptr_device[real_bs]
+                    )
             elif num_padding == 0:
                 self.query_start_loc_list[bs - 1].copy_(
                     self.cached_cuda_graph_verify_query_start_loc[: bs + 1]

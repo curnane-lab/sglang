@@ -90,6 +90,25 @@ def test_replay_zeroes_lengths_for_negative_cache_padding():
     )
 
 
+def test_replay_full_batch_does_not_assign_tier_slack_to_last_request():
+    backend = _backend(2)
+    layout = RaggedVerifyLayout.from_verify_lens(
+        verify_lens_cpu=[2, 6], device=torch.device("cpu"), grid=[16]
+    )
+    spec_info = SimpleNamespace(draft_token_num=8, ragged_verify_layout=layout, topk=1)
+    metadata = backend._replay_metadata(
+        2,
+        torch.tensor([3, 1], dtype=torch.int32),
+        ForwardMode.TARGET_VERIFY,
+        spec_info,
+        torch.tensor([10, 10], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        metadata.query_start_loc,
+        torch.tensor([0, 2, 8], dtype=torch.int32),
+    )
+
+
 def test_replay_uniform_keeps_static_metadata():
     backend = _backend(2)
     spec_info = SimpleNamespace(draft_token_num=8, ragged_verify_layout=None, topk=1)

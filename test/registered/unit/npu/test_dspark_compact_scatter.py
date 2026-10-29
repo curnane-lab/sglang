@@ -15,7 +15,7 @@ def test_scatter_compact_to_strided_into_matches_reference_with_ghost_slots():
     torch.manual_seed(20261028)
     device = "npu:0"
     layout = RaggedVerifyLayout.from_verify_lens(
-        verify_lens_cpu=[4] * 16, device=torch.device(device), grid=[64]
+        verify_lens_cpu=[4] * 15 + [2], device=torch.device(device), grid=[64]
     ).padded_to_bucket(padded_bs=64, cap=8)
     compact = torch.randn(64, 32, dtype=torch.bfloat16, device=device)
     out = torch.empty(64 * 8, 32, dtype=torch.bfloat16, device=device)

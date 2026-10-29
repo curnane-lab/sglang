@@ -229,15 +229,11 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
 
             batch_size = cache_indices.shape[0]
             draft_token_num = forward_batch.spec_info.draft_token_num
-            num_accepted_tokens = (
-                torch.full(
-                    (batch_size,),
-                    draft_token_num,
-                    dtype=torch.int32,
-                    device=mixed_qkv.device,
-                )
-                if ragged_layout is None
-                else torch.diff(query_start_loc).to(torch.int32)
+            num_accepted_tokens = torch.full(
+                (batch_size,),
+                draft_token_num,
+                dtype=torch.int32,
+                device=mixed_qkv.device,
             )
             mixed_qkv = torch.ops.npu.causal_conv1d(
                 mixed_qkv,

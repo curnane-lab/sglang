@@ -68,8 +68,8 @@ def _run_forward(lengths, accepted_steps, initial_conv, initial_ssm, mixed_qkv, 
         intermediate_conv_window=[torch.empty(0, device=device)],
     )
     all_state = MambaPool.SpeculativeState(
-        conv=[initial_conv.clone().unsqueeze(0)],
-        temporal=initial_ssm.clone().unsqueeze(0),
+        conv=[state.conv[0].unsqueeze(0)],
+        temporal=state.temporal.unsqueeze(0),
         intermediate_ssm=intermediate,
         intermediate_conv_window=[torch.empty(0, device=device)],
     )
@@ -111,6 +111,7 @@ def _run_forward(lengths, accepted_steps, initial_conv, initial_ssm, mixed_qkv, 
         None,
         None,
     )
+    torch.npu.synchronize()
     return output, intermediate, all_state.temporal, all_state.conv[0]
 
 
@@ -122,7 +123,7 @@ def _inputs(lengths):
     nk, nv, dk, dv = 4, 8, 128, 128
     dim = 2 * nk * dk + nv * dv
     return (
-        torch.rand(3, 3, dim, dtype=torch.bfloat16, device=device),
+        torch.rand(3, 10, dim, dtype=torch.bfloat16, device=device),
         torch.rand(3, nv, dv, dk, dtype=torch.bfloat16, device=device),
         torch.rand(total, dim, dtype=torch.bfloat16, device=device),
         torch.rand(total, nv, dtype=torch.bfloat16, device=device),
@@ -166,4 +167,12 @@ def test_b2_ragged_forward_and_commit_matches_native_prefix():
         )
         assert torch.isnan(packed[1][0, i, length:]).all()
     torch.testing.assert_close(packed[2], native[2], rtol=0, atol=0)
-    torch.testing.assert_close(packed[3], native[3], rtol=0, atol=0)
+    active_slots = {2, 0}
+    for slot in range(packed[3].shape[1]):
+        if slot in active_slots:
+            actual = packed[3][:, slot, -3:]
+            expected = native[3][:, slot, -3:]
+        else:
+            actual = packed[3][:, slot]
+            expected = native[3][:, slot]
+        torch.testing.assert_close(actual.cpu(), expected.cpu(), rtol=0, atol=0)

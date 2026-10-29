@@ -393,7 +393,8 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 # backend list there would replay stale capture-time lengths.
                 if self.model_runner.spec_algorithm.is_dflash():
                     _attn = self._replay_attn_backend()
-                    _meta = getattr(_attn, "forward_metadata", None)
+                    _full_attn = getattr(_attn, "full_attn_backend", _attn)
+                    _meta = getattr(_full_attn, "forward_metadata", None)
                     _meta_list = getattr(_meta, "seq_lens_cpu_list", None)
                 else:
                     _meta_list = None
