@@ -69,6 +69,33 @@ def _is_dflash_verify(spec_info: Optional[SpecInput]) -> bool:
     )
 
 
+def _bounded_full_coverage(
+    layout, padded_bs: int, verify_num_draft_tokens: int, verify_lens_cpu=None
+):
+    verify_lens_cpu = layout.verify_lens_cpu if verify_lens_cpu is None else verify_lens_cpu
+    if verify_lens_cpu is None:
+        raise RuntimeError("NPU ragged graph requires host-known verify lengths")
+    real_lens = list(verify_lens_cpu)
+    real_bs = next(
+        (i for i, length in enumerate(real_lens) if length == 0),
+        len(real_lens),
+    )
+    real_lens = real_lens[:real_bs]
+    remaining = layout.graph_num_tokens - sum(real_lens)
+    num_pad_reqs = padded_bs - real_bs
+    if num_pad_reqs:
+        base, rem = divmod(remaining, num_pad_reqs)
+        pad_lens = [base + 1] * rem + [base] * (num_pad_reqs - rem)
+        return real_lens + pad_lens, [0] * real_bs + pad_lens
+    if not real_lens:
+        raise ValueError("Ragged verify graph requires at least one real request")
+    verify_lens = list(real_lens)
+    verify_lens[-1] += remaining
+    extras = [0] * real_bs
+    extras[-1] = remaining
+    return verify_lens, extras
+
+
 def _expand_dsa_sparse_indices(topk_indices: torch.Tensor) -> torch.Tensor:
     """Expand [T, K] to [T, 1, K] for NPU sparse attention."""
     if topk_indices.dim() == 2:
@@ -311,6 +338,10 @@ def _cp_allgather_and_save_kv_npu(
 
 
 class AscendAttnBackend(AttentionBackend):
+    @property
+    def supports_ragged_verify_graph(self) -> bool:
+        return not self.use_mla
+
     def __init__(self, model_runner: ModelRunner, speculative_step_id: int = 0):
         super().__init__()
         self.forward_metadata = None
@@ -647,19 +678,29 @@ class AscendAttnBackend(AttentionBackend):
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
-            spec_tokens_per_req = (
-                int(forward_batch.spec_info.draft_token_num)
+            ragged_layout = (
+                forward_batch.spec_info.ragged_verify_layout
                 if forward_batch.forward_mode.is_target_verify()
-                else self.speculative_num_draft_tokens
+                else None
             )
-            self.forward_metadata.actual_seq_lengths_q = torch.arange(
-                spec_tokens_per_req,
-                spec_tokens_per_req
-                + forward_batch.seq_lens.shape[0] * spec_tokens_per_req,
-                spec_tokens_per_req,
-                dtype=torch.int32,
-                device=self.device,
-            )
+            if ragged_layout is not None and not self.use_mla:
+                self.forward_metadata.actual_seq_lengths_q = ragged_layout.qo_indptr_device[
+                    1:
+                ].to(torch.int32)
+            else:
+                spec_tokens_per_req = (
+                    int(forward_batch.spec_info.draft_token_num)
+                    if forward_batch.forward_mode.is_target_verify()
+                    else self.speculative_num_draft_tokens
+                )
+                self.forward_metadata.actual_seq_lengths_q = torch.arange(
+                    spec_tokens_per_req,
+                    spec_tokens_per_req
+                    + forward_batch.seq_lens.shape[0] * spec_tokens_per_req,
+                    spec_tokens_per_req,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
         elif forward_batch.forward_mode.is_decode_or_idle():
             self.forward_metadata.actual_seq_lengths_q = torch.tensor(
                 [1 + i for i in range(forward_batch.seq_lens.shape[0])],
@@ -1103,6 +1144,25 @@ class AscendAttnBackend(AttentionBackend):
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             seq_lens = seq_lens + self.speculative_step_offset_npu
         metadata.seq_lens[:bs].copy_(seq_lens[:bs])
+
+        ragged_layout = (
+            spec_info.ragged_verify_layout
+            if forward_mode.is_target_verify() and spec_info is not None
+            else None
+        )
+        if ragged_layout is not None and not self.use_mla:
+            coverage_lens, kv_extras = _bounded_full_coverage(
+                ragged_layout,
+                bs,
+                spec_info.draft_token_num,
+                getattr(spec_info, "_npu_ragged_verify_lens_cpu", None),
+            )
+            metadata.actual_seq_lengths_q.copy_(
+                torch.cumsum(torch.tensor(coverage_lens), dim=0).to(torch.int32)
+            )
+            metadata.seq_lens_cpu_list = [
+                length + extra for length, extra in zip(metadata.seq_lens_cpu_list, kv_extras)
+            ]
 
         self.forward_metadata = metadata
 
@@ -2487,15 +2547,21 @@ class AscendAttnBackend(AttentionBackend):
                 -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
             )
             query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
+            ragged_layout = (
+                forward_batch.spec_info.ragged_verify_layout
+                if forward_batch.forward_mode.is_target_verify()
+                else None
+            )
 
             if not self.graph_mode:
                 num_token_padding = query.shape[0]
                 query = query[: forward_batch.global_num_token_non_padded_cpu]
-                # Trim DP padding rows so actualSeqLengthsKv matches the
-                # operator's batchSize (TND layout); only target_verify has a
-                # uniform per-request width.
                 if forward_batch.forward_mode.is_target_verify():
-                    real_bs = query.shape[0] // self.speculative_num_draft_tokens
+                    real_bs = (
+                        query.shape[0] // self.speculative_num_draft_tokens
+                        if ragged_layout is None
+                        else ragged_layout.bs
+                    )
 
             if self.forward_metadata.seq_lens_cpu_int is None:
                 # Graph mode: bind the Python list, which graph.update can
@@ -2519,8 +2585,20 @@ class AscendAttnBackend(AttentionBackend):
                         : forward_batch._original_batch_size
                     ]
                 actual_seq_lengths = np.array(extend_seq_lens_cpu).cumsum().tolist()
+            elif ragged_layout is not None:
+                if self.graph_mode:
+                    coverage_lens, _ = _bounded_full_coverage(
+                        ragged_layout,
+                        len(actual_seq_lengths_kv),
+                        self.speculative_num_draft_tokens,
+                        getattr(
+                            forward_batch.spec_info, "_npu_ragged_verify_lens_cpu", None
+                        ),
+                    )
+                    actual_seq_lengths = np.cumsum(coverage_lens).tolist()
+                else:
+                    actual_seq_lengths = self.forward_metadata.actual_seq_lengths_q
             else:
-                # Static across replays ([spec_draft, 2*spec_draft, ...]).
                 actual_seq_lengths = np.arange(
                     self.speculative_num_draft_tokens,
                     self.speculative_num_draft_tokens + query.shape[0],
@@ -2555,7 +2633,7 @@ class AscendAttnBackend(AttentionBackend):
                 mask = self.mtp_mask
                 sparse_mode = 4 if is_swa_layer else 3
 
-            if self.is_hybrid_swa:
+            if self.is_hybrid_swa or ragged_layout is not None:
                 attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
                     query,
                     k_cache,

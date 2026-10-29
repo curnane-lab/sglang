@@ -90,9 +90,13 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                 self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
             )
         elif forward_mode.is_target_verify():
-            self.query_start_loc_list[bs - 1].copy_(
-                self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
-            )
+            ragged_layout = spec_info.ragged_verify_layout
+            if ragged_layout is None:
+                self.query_start_loc_list[bs - 1].copy_(
+                    self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
+                )
+            else:
+                self.query_start_loc_list[bs - 1].copy_(ragged_layout.qo_indptr_device)
             ssm_state_indices = torch.arange(
                 mamba_indices.shape[0] * spec_info.draft_token_num,
                 dtype=torch.int32,
@@ -146,7 +150,12 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         # Make sure forward metadata is correctly handled for padding reqs
         req_pool_indices[bs - num_padding :] = 0
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
-        mamba_indices[bs - num_padding :] = 0
+        ragged_layout = (
+            spec_info.ragged_verify_layout
+            if forward_mode.is_target_verify() and spec_info is not None
+            else None
+        )
+        mamba_indices[bs - num_padding :] = -1 if ragged_layout is not None else 0
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
         track_buf = None
         if mamba_track_indices is not None:
@@ -170,7 +179,17 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                 device=mamba_indices.device,
             )
             self.state_indices_list_gdn[bs - 1].copy_(ssm_state_indices)
-            if num_padding == 0:
+            if ragged_layout is not None:
+                if ragged_layout.bs != bs or ragged_layout.cap is None:
+                    ragged_layout = ragged_layout.padded_to_bucket(
+                        padded_bs=bs, cap=spec_info.draft_token_num
+                    )
+                self.query_start_loc_list[bs - 1].copy_(ragged_layout.qo_indptr_device)
+                if num_padding:
+                    query_start_loc = self.query_start_loc_list[bs - 1]
+                    real_token_total = query_start_loc[bs - num_padding].clone()
+                    query_start_loc[bs - num_padding :].copy_(real_token_total)
+            elif num_padding == 0:
                 self.query_start_loc_list[bs - 1].copy_(
                     self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
                 )

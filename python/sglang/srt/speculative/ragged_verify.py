@@ -64,11 +64,15 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
             return
         if not self.verify_lens_cpu:
             raise ValueError("RaggedVerifyLayout requires at least one request")
-        if min(self.verify_lens_cpu) < 1:
-            raise ValueError(
-                f"every request must verify the anchor (verify_len >= 1), got "
-                f"{self.verify_lens_cpu}"
-            )
+        first_zero = next(
+            (i for i, length in enumerate(self.verify_lens_cpu) if length == 0),
+            len(self.verify_lens_cpu),
+        )
+        if (
+            any(length < 1 for length in self.verify_lens_cpu[:first_zero])
+            or any(self.verify_lens_cpu[first_zero:])
+        ):
+            raise ValueError("padding lengths must be a zero-length suffix")
         if self.cap is not None and max(self.verify_lens_cpu) > self.cap:
             raise ValueError(
                 f"capped layout has a row exceeding cap={self.cap}: "
@@ -148,9 +152,14 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         *,
         verify_lens: torch.Tensor,
         graph_num_tokens: int,
+        verify_lens_cpu: Optional[list[int]] = None,
+        total_verify_tokens: Optional[int] = None,
     ) -> RaggedVerifyLayout:
         return cls._assemble_device(
-            verify_lens=verify_lens, graph_num_tokens=graph_num_tokens
+            verify_lens=verify_lens,
+            graph_num_tokens=graph_num_tokens,
+            verify_lens_cpu=verify_lens_cpu,
+            total_verify_tokens=total_verify_tokens,
         )
 
     @classmethod
@@ -163,6 +172,8 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         graph_num_tokens_floor: int = 0,
     ) -> RaggedVerifyLayout:
         verify_lens_list = [int(v) for v in verify_lens_cpu]
+        if any(length < 1 for length in verify_lens_list):
+            raise ValueError("every request must verify the anchor (verify_len >= 1)")
         total_verify_tokens = sum(verify_lens_list)
         bucket_input = max(total_verify_tokens, graph_num_tokens_floor)
         graph_num_tokens = round_up_grid(total=bucket_input, grid=grid)
@@ -194,13 +205,28 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
             bs=self.bs,
             padded_bs=padded_bs,
         )
+        padded_cpu = None
+        if self.verify_lens_cpu is not None:
+            padded_cpu = list(self.verify_lens_cpu)
+            leftover = self.graph_num_tokens - sum(padded_cpu)
+            num_pad_reqs = padded_bs - self.bs
+            if num_pad_reqs:
+                base, rem = divmod(leftover, num_pad_reqs)
+                padded_cpu.extend([base + 1] * rem + [base] * (num_pad_reqs - rem))
+            else:
+                padded_cpu[-1] += leftover
+            if cap is not None:
+                padded_cpu = [min(length, cap) for length in padded_cpu]
         if cap is not None:
             padded = torch.clamp(padded, max=cap)
 
         return RaggedVerifyLayout._assemble_device(
             verify_lens=padded,
             graph_num_tokens=self.graph_num_tokens,
-            total_verify_tokens=None if cap is not None else self.graph_num_tokens,
+            verify_lens_cpu=padded_cpu,
+            total_verify_tokens=(
+                sum(padded_cpu) if padded_cpu is not None else self.graph_num_tokens
+            ),
             cap=cap,
         )
 

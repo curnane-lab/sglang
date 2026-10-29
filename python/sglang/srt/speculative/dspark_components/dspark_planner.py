@@ -526,13 +526,16 @@ class DSparkVerifyPlanner:
             model_runner=self.model_runner,
             tier_num_tokens=tier_num_tokens,
         )
+        verify_lens_cpu = verify_lens.to("cpu").tolist()
         capture_num_tokens = ragged_capture_num_tokens(model_runner=self.model_runner)
         if graph_num_tokens_floor > 0 and capture_num_tokens is not None:
             graph_num_tokens = round_up_grid(graph_num_tokens_floor, capture_num_tokens)
             return RaggedVerifyLayout.from_verify_lens_device(
-                verify_lens=verify_lens, graph_num_tokens=graph_num_tokens
+                verify_lens=verify_lens,
+                graph_num_tokens=graph_num_tokens,
+                verify_lens_cpu=verify_lens_cpu,
+                total_verify_tokens=sum(verify_lens_cpu),
             )
-        verify_lens_cpu = verify_lens.to("cpu").tolist()
         grid = verify_layout_grid(
             verify_lens_cpu=verify_lens_cpu,
             ragged_verify_mode=self._ragged_verify_mode,

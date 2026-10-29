@@ -22,6 +22,8 @@ fused_gdn_gating = fused_gdn_gating_npu
 
 
 class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
+    supports_ragged_verify_graph = True
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         self.conv_states_shape = torch.Size(
@@ -37,6 +39,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         decode_backend = backends.decode
         prefill_backend = backends.prefill
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
+        self._num_accept_tokens_by_bs = {}
 
     def _prepare_mamba_track_metadata(self, forward_batch: ForwardBatch):
         if self.forward_metadata.has_mamba_track_mask:
@@ -54,21 +57,30 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
         cache_indices = self.forward_metadata.mamba_cache_indices
-        self.num_accept_tokens = torch.ones(
-            [bs], dtype=torch.int32, device=cache_indices.device
-        )
+        accept_tokens_by_bs = getattr(self, "_num_accept_tokens_by_bs", None)
+        if accept_tokens_by_bs is None:
+            accept_tokens_by_bs = self._num_accept_tokens_by_bs = {}
+        if bs not in accept_tokens_by_bs:
+            accept_tokens_by_bs[bs] = torch.ones(
+                [bs], dtype=torch.int32, device=cache_indices.device
+            )
+        self.num_accept_tokens = accept_tokens_by_bs[bs]
         self.actual_seq_lengths = torch.ones(
             [bs], dtype=torch.int32, device=cache_indices.device
         )
         if forward_mode.is_target_verify():
             seq_len = spec_info.draft_token_num
-            self.actual_seq_lengths = self.actual_seq_lengths * seq_len
-            # indices
+            ragged_layout = spec_info.ragged_verify_layout
+            self.actual_seq_lengths = (
+                self.actual_seq_lengths * seq_len
+                if ragged_layout is None
+                else torch.diff(self.forward_metadata.query_start_loc).to(torch.int32)
+            )
             self.ssm_state_indices = torch.arange(
                 cache_indices.shape[0] * seq_len,
                 dtype=torch.int32,
                 device=cache_indices.device,
-            )
+            ).view(cache_indices.shape[0], seq_len)
         else:
             self.ssm_state_indices = cache_indices
         if forward_mode.is_prefill():
@@ -196,8 +208,9 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             intermediate_conv_window_cache = (
                 mamba_cache_params.intermediate_conv_window[0]
             )
+            ragged_layout = forward_batch.spec_info.ragged_verify_layout
             has_initial_states = torch.ones(
-                seq_len // forward_batch.spec_info.draft_token_num,
+                cache_indices.shape[0],
                 dtype=torch.bool,
                 device=forward_batch.input_ids.device,
             )
@@ -216,11 +229,15 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
 
             batch_size = cache_indices.shape[0]
             draft_token_num = forward_batch.spec_info.draft_token_num
-            num_accepted_tokens = torch.full(
-                (batch_size,),
-                draft_token_num,
-                dtype=torch.int32,
-                device=mixed_qkv.device,
+            num_accepted_tokens = (
+                torch.full(
+                    (batch_size,),
+                    draft_token_num,
+                    dtype=torch.int32,
+                    device=mixed_qkv.device,
+                )
+                if ragged_layout is None
+                else torch.diff(query_start_loc).to(torch.int32)
             )
             mixed_qkv = torch.ops.npu.causal_conv1d(
                 mixed_qkv,
@@ -261,15 +278,14 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             g, beta = fused_gdn_gating_kernel_without_sigmoid(
                 layer.A_log, a, b, layer.dt_bias
             )
-            beta = beta.unsqueeze(0)
             num_heads, head_k_dim = layer.num_q_heads, layer.head_q_dim
             num_value_heads, head_v_dim = layer.num_v_heads, layer.head_v_dim
 
-            mixed_qkv_last_dim = mixed_qkv.shape[-1]
-
-            mixed_qkv = mixed_qkv.view(batch_size, -1, mixed_qkv_last_dim)
-            beta = beta.view(batch_size, -1, num_value_heads)
-            g = g.view(batch_size, -1, num_value_heads)
+            if ragged_layout is None:
+                beta = beta.unsqueeze(0)
+                mixed_qkv = mixed_qkv.view(batch_size, -1, mixed_qkv.shape[-1])
+                beta = beta.view(batch_size, -1, num_value_heads)
+                g = g.view(batch_size, -1, num_value_heads)
 
             core_attn_out = self.fused_recurrent_gated_delta_rule_update(
                 mixed_qkv,
@@ -383,8 +399,9 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
     ):
         beta = beta.to(torch.bfloat16)
         g = g.to(torch.float32)
-        batch_size = mix_qkv.shape[0]
-        seq_len = mix_qkv.shape[1]
+        packed = mix_qkv.dim() == 2
+        batch_size = cache_indices.shape[0] if packed else mix_qkv.shape[0]
+        seq_len = self.ssm_state_indices.shape[1] if packed else mix_qkv.shape[1]
         scale = 1 / (head_k_dim**0.5)
 
         if intermediate_state is not None:
@@ -393,32 +410,52 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             )
 
         if self.graph_mode:
-            num_accept_tokens = torch.full(
-                [batch_size], 1, dtype=torch.int32, device=cache_indices.device
-            )
-            actual_seq_lengths = torch.full(
-                [batch_size], seq_len, dtype=torch.int32, device=cache_indices.device
-            )
-            ssm_state_indices = self.forward_metadata.mamba_cache_indices_gdn
+            num_accept_tokens = self.num_accept_tokens
+            if packed:
+                actual_seq_lengths = self.actual_seq_lengths
+                ssm_state_indices = self.forward_metadata.mamba_cache_indices_gdn.view(
+                    batch_size, seq_len
+                )
+            else:
+                actual_seq_lengths = torch.full(
+                    [batch_size], seq_len, dtype=torch.int32, device=cache_indices.device
+                )
+                ssm_state_indices = self.forward_metadata.mamba_cache_indices_gdn
         else:
             num_accept_tokens = self.num_accept_tokens
             actual_seq_lengths = self.actual_seq_lengths
             ssm_state_indices = self.ssm_state_indices
 
-        attn_core_out = torch.ops.npu.recurrent_gated_delta_rule(
-            mix_qkv,
-            recurrent_state,
-            beta=beta,
-            scale=scale,
-            actual_seq_lengths=actual_seq_lengths,
-            ssm_state_indices=ssm_state_indices.view(batch_size, seq_len),
-            nk=num_heads,
-            nv=num_value_heads,
-            intermediate_state=intermediate_state,
-            cache_indices=cache_indices,
-            num_accepted_tokens=num_accept_tokens,
-            g=g,
-        )
+        if packed:
+            attn_core_out = torch.ops.npu.recurrent_gated_delta_rule_packed(
+                mix_qkv,
+                recurrent_state,
+                beta=beta,
+                scale=scale,
+                query_start_loc=self.forward_metadata.query_start_loc,
+                ssm_state_indices=ssm_state_indices,
+                nk=num_heads,
+                nv=num_value_heads,
+                intermediate_state=intermediate_state,
+                cache_indices=cache_indices,
+                num_accepted_tokens=num_accept_tokens,
+                g=g,
+            )
+        else:
+            attn_core_out = torch.ops.npu.recurrent_gated_delta_rule(
+                mix_qkv,
+                recurrent_state,
+                beta=beta,
+                scale=scale,
+                actual_seq_lengths=actual_seq_lengths,
+                ssm_state_indices=ssm_state_indices.view(batch_size, seq_len),
+                nk=num_heads,
+                nv=num_value_heads,
+                intermediate_state=intermediate_state,
+                cache_indices=cache_indices,
+                num_accepted_tokens=num_accept_tokens,
+                g=g,
+            )
 
         if intermediate_state is not None:
             intermediate_state = intermediate_state.view(

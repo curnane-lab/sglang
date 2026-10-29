@@ -50,6 +50,7 @@ def test_replay_updates_sequence_lengths_and_slices_logits_to_raw_batch():
     runner.is_dllm = False
     runner.if_use_v2 = False
     runner.use_fias_v2_bsnd = False
+    runner.ragged_verify_mode = False
     runner.capture_forward_mode = SimpleNamespace(is_target_verify=lambda: False)
     runner._init_arch_map()
 
@@ -88,6 +89,23 @@ def test_replay_updates_sequence_lengths_and_slices_logits_to_raw_batch():
     )
     torch.testing.assert_close(output.next_token_logits, torch.tensor([[0.0], [1.0]]))
     torch.testing.assert_close(output.hidden_states, torch.tensor([[0.0], [1.0]]))
+
+
+def test_ragged_non_mla_verify_uses_v2_kv_update_key():
+    runner = mod.NPUGraphRunner.__new__(mod.NPUGraphRunner)
+    runner.if_use_v2 = False
+    runner.use_fias_v2_bsnd = False
+    runner.ragged_verify_mode = True
+    runner.is_dllm = False
+    runner.capture_forward_mode = SimpleNamespace(is_target_verify=lambda: True)
+    runner.model_runner = SimpleNamespace(
+        model_config=SimpleNamespace(attention_arch=mod.AttentionArch.MHA)
+    )
+    runner._init_arch_map()
+
+    assert runner._get_update_attr_name() == "actual_seq_kvlen"
+    runner.ragged_verify_mode = False
+    assert runner._get_update_attr_name() == "actual_seq_lengths_kv"
 
 
 if __name__ == "__main__":

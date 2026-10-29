@@ -44,6 +44,7 @@ class TestPaddedRaggedVerifyGeometry(CustomTestCase):
         padded = raw.padded_to_bucket(padded_bs=4)
         self.assertEqual(padded.bs, 4)
         self.assertEqual(padded.verify_lens.tolist(), [8, 1, 3, 20])
+        self.assertEqual(padded.verify_lens_cpu, [8, 1, 3, 20])
         self.assertEqual(padded.qo_indptr_device.tolist(), [0, 8, 9, 12, 32])
         seq_lens = torch.tensor([10, 20, 30, 1], dtype=torch.int32)
         geometry = build_ragged_target_verify_geometry(seq_lens=seq_lens, layout=padded)
@@ -83,7 +84,34 @@ class TestPaddedRaggedVerifyGeometry(CustomTestCase):
         self.assertEqual(raw.graph_num_tokens, 16)
         padded = raw.padded_to_bucket(padded_bs=8)
         self.assertEqual(padded.verify_lens.tolist(), [8, 8, 0, 0, 0, 0, 0, 0])
+        self.assertEqual(padded.verify_lens_cpu, [8, 8, 0, 0, 0, 0, 0, 0])
         self.assertEqual(int(padded.qo_indptr_device[-1]), 16)
+
+    def test_device_layout_preserves_host_lengths_through_full_coverage_padding(self):
+        raw = RaggedVerifyLayout.from_verify_lens_device(
+            verify_lens=torch.tensor([4] * 16, dtype=torch.int32, device=_DEVICE),
+            graph_num_tokens=64,
+            verify_lens_cpu=[4] * 16,
+            total_verify_tokens=64,
+        )
+        padded = raw.padded_to_bucket(padded_bs=64)
+        self.assertEqual(padded.verify_lens_cpu, [4] * 16 + [0] * 48)
+        self.assertEqual(padded.total_verify_tokens, 64)
+
+    def test_capped_padding_preserves_host_lengths(self):
+        raw = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=[4] * 16, device=_DEVICE, grid=[64]
+        )
+        padded = raw.padded_to_bucket(padded_bs=64, cap=8)
+        self.assertEqual(padded.verify_lens_cpu, [4] * 16 + [0] * 48)
+        self.assertEqual(padded.total_verify_tokens, 64)
+        with self.assertRaises(ValueError):
+            RaggedVerifyLayout._assemble(
+                verify_lens_cpu=[4, 0, 4],
+                total_verify_tokens=8,
+                graph_num_tokens=8,
+                device=_DEVICE,
+            ).padded_to_bucket(padded_bs=3, cap=8)
 
 
 class TestCaptureVerifyLens(CustomTestCase):

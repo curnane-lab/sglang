@@ -334,6 +334,8 @@ class _SelectorDraftSampler:
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         """Host-side refresh of the static sampling params; must run before the draft
         graph replay that consumes them."""
+        if bs > self.greedy_mask.numel():
+            return
         if sampling_info is None or not self.sampling_enabled:
             self.temperatures[:bs].fill_(1.0)
             self.greedy_mask[:bs].fill_(True)
@@ -505,8 +507,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_sampler = None
         self.draft_model = bundle.draft_model
         self.selector = self.draft_model.candidate_selector
-        # Ascend keeps selector proposal aligned with its greedy-only verify path.
-        self._selector_sampling_enabled = not _is_npu
+        # Ascend static verify stays greedy-only; ragged planning uses the tested Torch selector path.
+        self._selector_sampling_enabled = not _is_npu or read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
         self.lilicorr = self.draft_model.lilicorr
         # The sampled commit rides the selector's accept path.
         self._lilicorr_sampling_enabled = self.lilicorr is not None and (

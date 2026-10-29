@@ -431,7 +431,7 @@ def compact_verify_ids_triton(
 class ScatterCompactToStrided:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
-        if inputs_on_cuda(*args, **kwargs):
+        if inputs_on_cuda(*args, **kwargs) and not _is_npu:
             return cls.triton(*args, **kwargs)
         return cls.torch(*args, **kwargs)
 
@@ -536,6 +536,23 @@ def scatter_compact_to_strided_into(
     fill_value = float(fill_value) if out.dtype.is_floating_point else int(fill_value)
     compact = compact.contiguous()
     verify_lens = verify_lens.to(dtype=torch.int64).contiguous()
+    if _is_npu:
+        out.fill_(fill_value)
+        req_id, within, valid = compact_row_index(
+            verify_lens=verify_lens,
+            padded_total=compact.shape[0],
+            device=compact.device,
+        )
+        bs = verify_lens.numel()
+        strided_pos = torch.where(
+            valid,
+            req_id.clamp(max=bs - 1) * stride + within,
+            torch.zeros_like(within),
+        )
+        previous = out.index_select(0, strided_pos)
+        values = torch.where(valid.unsqueeze(1), compact, previous)
+        out.index_copy_(0, strided_pos, values)
+        return out
     start = (torch.cumsum(verify_lens, dim=0) - verify_lens).contiguous()
     n_out = out.shape[0]
     BLOCK_D = 1024

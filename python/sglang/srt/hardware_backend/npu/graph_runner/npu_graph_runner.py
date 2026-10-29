@@ -64,6 +64,7 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
+from sglang.srt.hardware_backend.npu.attention.ascend_backend import _bounded_full_coverage
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
@@ -162,8 +163,14 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         # IDLE DP ranks replay the same target-verify graph as active ranks.
         # Select the handler from the captured graph, not the runtime mode;
         # a V1 update key is ignored by V2 and leaves stale KV lengths behind.
-        return self.if_use_v2 or (
-            self.use_fias_v2_bsnd and self.capture_forward_mode.is_target_verify()
+        return (
+            self.if_use_v2
+            or (self.use_fias_v2_bsnd and self.capture_forward_mode.is_target_verify())
+            or (
+                self.ragged_verify_mode
+                and self.capture_forward_mode.is_target_verify()
+                and self.model_runner.model_config.attention_arch != AttentionArch.MLA
+            )
         )
 
     def _capture_graph(self, graph, pool, stream, run_once_fn):
@@ -238,6 +245,14 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        spec_info = getattr(forward_batch, "spec_info", None)
+        ragged_layout = (
+            spec_info.ragged_verify_layout
+            if forward_batch.forward_mode.is_target_verify() and spec_info is not None
+            else None
+        )
+        if ragged_layout is not None and ragged_layout.verify_lens_cpu is not None:
+            spec_info._npu_ragged_verify_lens_cpu = ragged_layout.verify_lens_cpu
         if forward_batch.needs_forward_metadata_init():
             self.load_batch(forward_batch, pp_proxy_tensors)
         else:
@@ -413,12 +428,44 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                     seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
                         self.bs - self.raw_bs
                     )
-            output = self.backend.replay_with_input_update(
-                graph_key,
-                seq_lens=seq_lens,
-                attr_name=self._get_update_attr_name(),
-                attr_type=self._get_update_attr_type(),
+            cpu_update_input = None
+            ragged_layout = (
+                forward_batch.spec_info.ragged_verify_layout
+                if forward_batch.forward_mode.is_target_verify()
+                and forward_batch.spec_info is not None
+                else None
             )
+            if (
+                ragged_layout is not None
+                and self.ragged_verify_mode
+                and self.model_runner.model_config.attention_arch != AttentionArch.MLA
+            ):
+                coverage_lens, kv_extras = _bounded_full_coverage(
+                    ragged_layout, self.bs, forward_batch.spec_info.draft_token_num
+                )
+                if _meta_list is None:
+                    seq_lens = [length + extra for length, extra in zip(seq_lens, kv_extras)]
+                cpu_update_input = [
+                    {
+                        self._get_update_attr_name(): seq_lens,
+                        "actual_seq_qlen": np.cumsum(coverage_lens).tolist(),
+                    }
+                ]
+            if cpu_update_input is None:
+                output = self.backend.replay_with_input_update(
+                    graph_key,
+                    seq_lens=seq_lens,
+                    attr_name=self._get_update_attr_name(),
+                    attr_type=self._get_update_attr_type(),
+                )
+            else:
+                output = self.backend.replay_with_input_update(
+                    graph_key,
+                    seq_lens=seq_lens,
+                    attr_name=self._get_update_attr_name(),
+                    attr_type=self._get_update_attr_type(),
+                    cpu_update_input=cpu_update_input,
+                )
         else:
             output = self.backend.replay(graph_key, forward_batch)
 
