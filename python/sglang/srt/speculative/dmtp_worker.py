@@ -141,9 +141,10 @@ class DMTPWorkerV2(DFlashWorkerV2):
         if controller.two_graphs:
             controller.df_tail.freeze_outputs()
         runner = self.draft_model_runner.decode_cuda_graph_runner
-        if runner is not None:
+        captured_width = getattr(runner, "captured_req_width", None)
+        if captured_width is not None:
             widths = (
-                runner.captured_req_width,
+                captured_width,
                 self._draft_block_spec_info.draft_token_num,
                 self._draft_block_spec_info.num_tokens_per_req,
                 self._draft_block_spec_info.num_tokens_for_logprob_per_req,
@@ -151,10 +152,7 @@ class DMTPWorkerV2(DFlashWorkerV2):
             if any(width != self._mtp_first.draft_slots for width in widths):
                 raise RuntimeError(f"DMTP DF capture/metadata width mismatch: {widths}")
         backend = self.draft_model_runner.attn_backend
-        if (
-            self.draft_model_runner.decode_cuda_graph_runner is not None
-            and backend.mtp_anchor_fa3.capture_calls < 1
-        ):
+        if captured_width is not None and backend.mtp_anchor_fa3.capture_calls < 1:
             raise RuntimeError("DMTP anchor-relative FA3 adapter was not captured")
         self._mtp_first.native.init_cuda_graphs()
         self._mtp_first.init_graphs()

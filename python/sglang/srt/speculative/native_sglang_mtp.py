@@ -22,6 +22,13 @@ from sglang.srt.speculative.mtp_hidden_only import HiddenOnlyLogitsProcessor
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
+def _kv_token_rows(pool, page_size):
+    keys, values = pool.get_kv_buffer(pool.start_layer)
+    if page_size == 1:
+        return keys, values
+    return keys.view(-1, *keys.shape[2:]), values.view(-1, *values.shape[2:])
+
+
 class NativeSGLangMTP:
     def __init__(self, owner):
         self.graph_requested = (
@@ -39,15 +46,18 @@ class NativeSGLangMTP:
         self.graph_audit_count = 0
         self.owner = owner
         args = deepcopy(owner.server_args)
-        declare_resolution(args, "dmtp_private_mtp", **mtp_config(owner))
-        with scoped_config(**mtp_config(owner)):
+        config = mtp_config(owner)
+        declare_resolution(args, "dmtp_private_mtp", **config)
+        with scoped_config(**config):
             self.worker = TpModelWorker(
                 server_args=args,
                 gpu_id=owner.gpu_id,
                 nccl_port=owner.nccl_port,
                 is_draft_worker=True,
                 context_length=owner.model_runner.model_config.context_len,
-                draft_attention_backend="fa3",
+                draft_attention_backend=config[
+                    "speculative_draft_attention_backend"
+                ],
                 random_seed=owner.target_worker.random_seed,
             )
         target = owner.target_worker.model_runner.model
@@ -104,13 +114,13 @@ class NativeSGLangMTP:
     def init_cuda_graphs(self):
         with scoped_config(**mtp_config(self.owner)):
             self.worker.init_cuda_graphs(capture_decode_cuda_graph=False)
-        if self.graph_requested:
-            if not self.hidden_only.enabled:
-                raise ValueError("MTP update graph requires hidden-only native output")
-            from sglang.srt.speculative.native_mtp_bridge import NativeMTPBridge
+        if self.graph_requested and not self.hidden_only.enabled:
+            raise ValueError("MTP update graph requires hidden-only native output")
+        from sglang.srt.speculative.native_mtp_bridge import NativeMTPBridge
 
-            with scoped_config(**mtp_config(self.owner)):
-                self.bridge = NativeMTPBridge(self)
+        with scoped_config(**mtp_config(self.owner)):
+            self.bridge = NativeMTPBridge(self)
+        if self.graph_requested:
             self.update_graphs = self.bridge
 
     def forward(self, batch):
@@ -183,7 +193,9 @@ class NativeSGLangMTP:
                         "MTP continuation does not match its pending anchor"
                     )
             pool = self.worker.model_runner.token_to_kv_pool
-            keys, values = pool.get_kv_buffer(pool.start_layer)
+            keys, values = _kv_token_rows(
+                pool, self.owner.server_args.page_size
+            )
             keys.index_copy_(
                 0, prepared.anchor_locations, keys[prepared.pending_locations]
             )
@@ -249,7 +261,9 @@ class NativeSGLangMTP:
         )
         if self.last_graph_used and self._graph_check_required(graphs, lengths):
             pool = self.worker.model_runner.token_to_kv_pool
-            keys, values = pool.get_kv_buffer(pool.start_layer)
+            keys, values = _kv_token_rows(
+                pool, self.owner.server_args.page_size
+            )
             graph_keys, graph_values = (
                 keys[cache_locations.long()].clone(),
                 values[cache_locations.long()].clone(),
@@ -274,7 +288,9 @@ class NativeSGLangMTP:
         if audit:
             original = result.hidden_states.clone()
             pool = self.worker.model_runner.token_to_kv_pool
-            keys, values = pool.get_kv_buffer(pool.start_layer)
+            keys, values = _kv_token_rows(
+                pool, self.owner.server_args.page_size
+            )
             before_k, before_v = (
                 keys[cache_locations.long()].clone(),
                 values[cache_locations.long()].clone(),
@@ -335,7 +351,9 @@ class NativeSGLangMTP:
                 torch.tensor(starts, device=old_locations.device)
             ].long()
             pool = self.worker.model_runner.token_to_kv_pool
-            keys, values = pool.get_kv_buffer(pool.start_layer)
+            keys, values = _kv_token_rows(
+                pool, self.owner.server_args.page_size
+            )
             keys.index_copy_(0, dst, keys[src])
             values.index_copy_(0, dst, values[src])
             own[req_indices.long(), torch.tensor(prefixes, device=own.device) - 1] = (

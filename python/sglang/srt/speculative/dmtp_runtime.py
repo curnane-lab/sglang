@@ -36,7 +36,9 @@ def mtp_config(owner):
         speculative_eagle_topk=1,
         speculative_num_steps=1,
         speculative_num_draft_tokens=8,
-        speculative_draft_attention_backend="fa3",
+        speculative_draft_attention_backend=(
+            owner.server_args.speculative_draft_attention_backend or "fa3"
+        ),
     )
 
 
@@ -50,14 +52,20 @@ def validate_recipe():
     ):
         if cfg(name):
             raise ValueError(f"DMTP does not support {name}")
-    if cfg("page_size") != 1 or cfg("quantization") is not None:
-        raise ValueError("DMTP requires page size 1 and unquantized weights")
+    backend = cfg("speculative_draft_attention_backend")
+    if backend not in ("fa3", "ascend"):
+        raise ValueError("DMTP requires FA3 or Ascend draft attention")
+    if cfg("quantization") is not None:
+        raise ValueError("DMTP requires unquantized weights")
+    expected_page_size = 1 if backend == "fa3" else 16
+    if cfg("page_size") != expected_page_size:
+        raise ValueError(
+            f"DMTP {backend} requires page size {expected_page_size}"
+        )
     if cfg("speculative_num_draft_tokens") != 8:
         raise ValueError(
             "DMTP requires eight Target slots, not the checkpoint's DF block size"
         )
-    if cfg("speculative_draft_attention_backend") != "fa3":
-        raise ValueError("DMTP requires FA3 draft attention")
     capacity = cfg("max_running_requests")
     if capacity is None or not 1 <= capacity <= 32:
         raise ValueError("DMTP requires an explicit request capacity in 1..32")

@@ -1,4 +1,4 @@
-"""GPU-only DFlash verification -> native MTP draft-extend bridge."""
+"""DFlash verification -> native MTP draft-extend bridge."""
 
 import logging
 import os
@@ -102,7 +102,7 @@ def validate_bridge_proposals(controller):
         or controller.batch_trace
     ):
         raise ValueError(
-            "GPU bridge requires native sampled proposals "
+            "Native MTP bridge requires native sampled proposals "
             "without per-request debug traces"
         )
 
@@ -123,14 +123,17 @@ class NativeMTPBridge:
                 self.backend.extend_attention_fwd, mtp_query_tile=True
             )
             print("MTP_QUERY_TILE block_m=16 block_n=unchanged", flush=True)
-        from sglang.srt.speculative.mtp_anchor_fa3 import Fixed8FA3Metadata
+        self.graph = None
+        if native.graph_requested:
+            from sglang.srt.speculative.mtp_anchor_fa3 import Fixed8FA3Metadata
 
-        assert self.backend.fa_impl_ver == 3
-        self.backend.mtp_fixed8_metadata = Fixed8FA3Metadata(self.backend)
-        self.backend.init_forward_metadata_out_graph = self.backend.mtp_fixed8_metadata
-        print("MTP_FA3_BACKEND", type(self.backend).__name__, flush=True)
-        self.graph = DMTPMTPGraphRunner(native, self.backend)
-        self.max_batch = self.graph.max_bs
+            assert self.backend.fa_impl_ver == 3
+            self.backend.mtp_fixed8_metadata = Fixed8FA3Metadata(self.backend)
+            self.backend.init_forward_metadata_out_graph = (
+                self.backend.mtp_fixed8_metadata
+            )
+            print("MTP_FA3_BACKEND", type(self.backend).__name__, flush=True)
+        self.max_batch = native.owner.server_args.max_running_requests
         self.capacity = self.max_batch * 8
         self.mapping = runner.req_to_token_pool.req_to_token
         self.context_limit = self.mapping.shape[1]
@@ -170,7 +173,10 @@ class NativeMTPBridge:
         self.verified_batches = set()
         self.graph_audit_count = 0
         self.hits = self.fallbacks = 0
-        self.batches = {bs: self._batch(bs) for bs in self.graph.capture_bs}
+        self.batches = {}
+        if native.graph_requested:
+            self.graph = DMTPMTPGraphRunner(native, self.backend)
+            self.batches = {bs: self._batch(bs) for bs in self.graph.capture_bs}
 
     def _batch(self, bs):
         n = bs * 8
@@ -227,7 +233,7 @@ class NativeMTPBridge:
         tokens = self.token_by_req.index_select(0, c.req_indices)
         torch._assert_async(
             ((expected == self.prefix) & (tokens == block_ids[:, 0])).all(),
-            "MTP GPU request/anchor/cache state is not aligned",
+            "Native MTP request/anchor/cache state is not aligned",
         )
         c.sampling = c.validate_sampling(batch)
         c.hidden = self.hidden_by_req.index_select(0, c.req_indices)
@@ -292,7 +298,7 @@ class NativeMTPBridge:
                 & (next_positions == self.prefix + counts)
                 & (self.prefix >= 1)
             ).all(),
-            "MTP GPU commit counts/positions mismatch",
+            "Native MTP commit counts/positions mismatch",
         )
         hidden = c.target_hidden(bs * 8).view(bs, 8, -1)
         if c.two_graphs:

@@ -90,10 +90,11 @@ class DMTPSelectorGraphs:
         self.graphs, self.outputs, self.checked = {}, {}, set()
         self.last_used = False
         self.initial_signature = self.signature()
+        if not enable_graph:
+            self.done = None
+            return
         self.done = torch.cuda.Event()
         self.done.record()
-        if not enable_graph:
-            return
         stream = torch.cuda.Stream(device=device)
         stream.wait_stream(torch.cuda.current_stream(device))
         pool = torch.cuda.graph_pool_handle()

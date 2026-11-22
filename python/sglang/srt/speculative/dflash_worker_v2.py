@@ -478,8 +478,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_sampler = None
         self.draft_model = bundle.draft_model
         self.selector = self.draft_model.candidate_selector
-        # Ascend keeps selector proposal aligned with its greedy-only verify path.
-        self._selector_sampling_enabled = not _is_npu
+        # Ascend defaults to greedy-only verify; sampled selector verify is opt-in.
+        self._selector_sampling_enabled = not _is_npu or os.getenv(
+            "SGLANG_DFLASH_NPU_SELECTOR_SAMPLING", "0"
+        ) == "1"
         self.lilicorr = self.draft_model.lilicorr
         # The sampled commit rides the selector's accept path.
         self._lilicorr_sampling_enabled = self.lilicorr is not None and (

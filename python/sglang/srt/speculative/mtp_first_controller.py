@@ -30,6 +30,12 @@ class MTPFirstController:
             backend.mtp_anchor_fa3 = AnchorFA3Forward(backend)
             backend.forward_extend = backend.mtp_anchor_fa3
             return
+        if type(backend).__name__ == "AscendAttnBackend":
+            from sglang.srt.speculative.mtp_anchor_ascend import AnchorAscendForward
+
+            backend.mtp_anchor_ascend = AnchorAscendForward(backend)
+            backend.forward_mtp = backend.mtp_anchor_ascend
+            return
         if getattr(backend, "enable_deterministic", False):
             raise ValueError(
                 "MTP-first requires the explicit-mask two-stage draft backend"
@@ -57,8 +63,8 @@ class MTPFirstController:
                 "MTP-first requires 1..32 requests, "
                 "no quantization; compact draft KV parity is not yet validated"
             )
-        if args.speculative_draft_attention_backend != "fa3":
-            raise ValueError("FA3 alignment runtime requires FA3 draft attention")
+        if args.speculative_draft_attention_backend not in ("fa3", "ascend"):
+            raise ValueError("MTP-first requires FA3 or Ascend draft attention")
         if float(os.getenv("SGLANG_SIMULATE_ACC_LEN", "0")) > 0:
             raise ValueError("MTP-first must not use mock acceptance")
         self.draft_slots = 8
@@ -121,7 +127,8 @@ class MTPFirstController:
             return
         from sglang.srt.speculative.dmtp_selector_graph import DMTPSelectorGraphs
 
-        enabled = self.worker.draft_model_runner.decode_cuda_graph_runner is not None
+        runner = self.worker.draft_model_runner.decode_cuda_graph_runner
+        enabled = getattr(runner, "captured_req_width", None) is not None
         self.t1_selector = DMTPSelectorGraphs(self, t1=True, enable_graph=enabled)
         self.tail_selector = DMTPSelectorGraphs(self, t1=False, enable_graph=enabled)
         self.conditioner_graphs = None
@@ -183,7 +190,10 @@ class MTPFirstController:
 
     def alloc_hidden_cache(self):
         pool = self.native.worker.model_runner.token_to_kv_pool
-        rows = pool.get_key_buffer(pool.start_layer).shape[0]
+        rows = (
+            pool.get_key_buffer(pool.start_layer).shape[0]
+            * self.worker.server_args.page_size
+        )
         self.target_hidden_cache = torch.empty(
             (rows, self.final_buffer.shape[1]),
             device=self.final_buffer.device,
@@ -390,6 +400,9 @@ class MTPFirstController:
         )
 
     def mask(self, seq_lens):
+        backend = self.worker.draft_model_runner.attn_backend
+        if getattr(backend, "mtp_anchor_ascend", None) is not None:
+            return None
         if os.getenv("SGLANG_DMTP_FA3_SKIP_DENSE_MASK", "0") == "1":
             from sglang.srt.speculative.mtp_anchor_fa3 import AnchorFA3Forward
 

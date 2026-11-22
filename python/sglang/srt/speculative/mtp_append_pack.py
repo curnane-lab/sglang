@@ -141,46 +141,72 @@ def pack_commit(
         anchor_locations=torch.empty(bs, dtype=torch.int64, device=device),
         pending_locations=torch.empty(bs, dtype=torch.int64, device=device),
     )
-    _pack[(bs, triton.cdiv(hidden.shape[-1], 256))](
-        candidates,
-        bonus,
-        hidden,
-        locations,
-        reqs,
-        meta,
-        packed.tokens,
-        packed.hidden,
-        packed.cache_locations,
-        packed.native_locations,
-        packed.positions,
-        packed.last_rows,
-        packed.anchor_locations,
-        packed.pending_locations,
-        B=bs,
-        H=hidden.shape[-1],
-        PENDING=pending_base,
-        C0=candidates.stride(0),
-        C1=candidates.stride(1),
-        BONUS_STRIDE=bonus.stride(0),
-        H0=hidden.stride(0),
-        H1=hidden.stride(1),
-        H2=hidden.stride(2),
-        L0=locations.stride(0),
-        L1=locations.stride(1),
-        REQ_STRIDE=reqs.stride(0),
-        BLOCK=256,
-    )
+    if candidates.device.type == "cuda":
+        _pack[(bs, triton.cdiv(hidden.shape[-1], 256))](
+            candidates,
+            bonus,
+            hidden,
+            locations,
+            reqs,
+            meta,
+            packed.tokens,
+            packed.hidden,
+            packed.cache_locations,
+            packed.native_locations,
+            packed.positions,
+            packed.last_rows,
+            packed.anchor_locations,
+            packed.pending_locations,
+            B=bs,
+            H=hidden.shape[-1],
+            PENDING=pending_base,
+            C0=candidates.stride(0),
+            C1=candidates.stride(1),
+            BONUS_STRIDE=bonus.stride(0),
+            H0=hidden.stride(0),
+            H1=hidden.stride(1),
+            H2=hidden.stride(2),
+            L0=locations.stride(0),
+            L1=locations.stride(1),
+            REQ_STRIDE=reqs.stride(0),
+            BLOCK=256,
+        )
+        return packed
+    for b, (prefix, count, start) in enumerate(zip(prefixes, counts, starts)):
+        end = start + count
+        req = reqs[b]
+        packed.tokens[start:end] = torch.cat((candidates[b, 1:count], bonus[b : b + 1]))
+        packed.hidden[start:end] = hidden[b, :count]
+        packed.cache_locations[start:end] = locations[b, :count]
+        packed.native_locations[start:end] = torch.cat(
+            (locations[b, 1:count], (pending_base + req).reshape(1))
+        )
+        packed.positions[start:end] = torch.arange(
+            prefix + 1, prefix + count + 1, dtype=torch.int64, device=device
+        )
+        packed.last_rows[b] = end - 1
+        packed.anchor_locations[b] = locations[b, 0]
+        packed.pending_locations[b] = pending_base + req
     return packed
 
 
 def scatter_commit_mapping(reqs, packed, mapping):
-    _scatter_mapping[(reqs.numel(),)](
-        reqs,
-        packed.metadata,
-        packed.native_locations,
-        packed.anchor_locations,
-        mapping,
-        B=reqs.numel(),
-        MAP_STRIDE=mapping.stride(0),
-        REQ_STRIDE=reqs.stride(0),
-    )
+    if mapping.device.type == "cuda":
+        _scatter_mapping[(reqs.numel(),)](
+            reqs,
+            packed.metadata,
+            packed.native_locations,
+            packed.anchor_locations,
+            mapping,
+            B=reqs.numel(),
+            MAP_STRIDE=mapping.stride(0),
+            REQ_STRIDE=reqs.stride(0),
+        )
+        return
+    prefixes, counts, starts = packed.metadata.tolist()
+    for b, (prefix, count, start) in enumerate(zip(prefixes, counts, starts)):
+        req = reqs[b]
+        mapping[req, prefix - 1] = packed.anchor_locations[b]
+        mapping[req, prefix : prefix + count] = packed.native_locations[
+            start : start + count
+        ]
