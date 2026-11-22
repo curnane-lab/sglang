@@ -3478,9 +3478,7 @@ class Scheduler(
         if self.spec_algorithm.is_dflash_family():
             error_msg = validate_dflash_request(req, self.enable_overlap)
             if error_msg is not None:
-                req.set_finish_with_abort(error_msg)
-                self.init_req_max_new_tokens(req)
-                self._add_request_to_queue(req)
+                self._reject_dflash_request(req, error_msg)
                 return
 
         if self.spec_algorithm.is_uno():
@@ -3852,6 +3850,10 @@ class Scheduler(
                 req.time_stats.set_wait_queue_entry_time()
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
+
+    def _reject_dflash_request(self, req: Req, error_msg: str) -> None:
+        prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+        self.request_retirer.retire_unadmitted(req)
 
     def _reject_sampling_mask_request(self, req: Req, error_msg: str) -> None:
         """Return a sampling-mask validation error without running the model."""

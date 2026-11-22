@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from numbers import Integral
@@ -1265,5 +1266,11 @@ def build_speculative_verify_target_probs(
 def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
+    if (
+        os.getenv("SGLANG_DMTP_T1_RESIDUAL", "0") == "1"
+        and get_spec().speculative_draft_attention_backend == "ascend"
+        and req.sampling_params.top_k != 1
+    ):
+        return "Ascend DMTP requires greedy sampling (top_k=1 or temperature=0)."
 
     return None

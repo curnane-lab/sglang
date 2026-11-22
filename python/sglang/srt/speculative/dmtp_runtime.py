@@ -59,6 +59,8 @@ def validate_recipe():
     if cfg("quantization") is not None:
         raise ValueError("DMTP requires unquantized weights")
     if backend == "ascend":
+        if cfg("enable_hierarchical_cache"):
+            raise ValueError("Ascend DMTP does not support HiCache")
         if not cuda_graph_fully_disabled() or not cfg("disable_overlap_schedule"):
             raise ValueError(
                 "Ascend DMTP requires decode/prefill graphs and overlap scheduling "

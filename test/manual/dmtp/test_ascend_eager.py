@@ -312,6 +312,52 @@ class NativeKVLayoutTests(unittest.TestCase):
         self.assertEqual(write.window_locs["window"].tolist(), [3])
 
 
+class RequestAdmissionTests(unittest.TestCase):
+    def test_non_greedy_is_rejected_before_worker_and_greedy_is_allowed(self):
+        from unittest.mock import patch
+
+        from sglang.srt.speculative.dflash_utils import validate_dflash_request
+
+        request = SimpleNamespace(
+            return_hidden_states=False,
+            sampling_params=SimpleNamespace(top_k=1 << 30),
+        )
+        spec = SimpleNamespace(speculative_draft_attention_backend="ascend")
+        with (
+            patch.dict("os.environ", {"SGLANG_DMTP_T1_RESIDUAL": "1"}),
+            patch("sglang.srt.speculative.dflash_utils.get_spec", return_value=spec),
+        ):
+            error = validate_dflash_request(request, enable_overlap=False)
+            self.assertIn("top_k=1", error)
+            request.sampling_params.top_k = 1
+            self.assertIsNone(validate_dflash_request(request, enable_overlap=False))
+            with patch.dict("os.environ", {"SGLANG_DMTP_T1_RESIDUAL": "0"}):
+                request.sampling_params.top_k = 1 << 30
+                self.assertIsNone(
+                    validate_dflash_request(request, enable_overlap=False)
+                )
+            spec.speculative_draft_attention_backend = "fa3"
+            self.assertIsNone(validate_dflash_request(request, enable_overlap=False))
+
+    def test_rejected_request_is_retired_without_entering_scheduler_queue(self):
+        from http import HTTPStatus
+        from unittest.mock import Mock, patch
+
+        from sglang.srt.managers.scheduler import Scheduler
+
+        scheduler = SimpleNamespace(
+            request_retirer=Mock(), _add_request_to_queue=Mock()
+        )
+        request = SimpleNamespace(rid="non-greedy")
+        with patch("sglang.srt.managers.scheduler.prepare_abort") as prepare:
+            Scheduler._reject_dflash_request(scheduler, request, "greedy only")
+        prepare.assert_called_once_with(
+            request, "greedy only", status_code=HTTPStatus.BAD_REQUEST
+        )
+        scheduler.request_retirer.retire_unadmitted.assert_called_once_with(request)
+        scheduler._add_request_to_queue.assert_not_called()
+
+
 class PageRecipeTests(unittest.TestCase):
     def test_ascend_uses_page16_and_fa3_keeps_page1(self):
         from unittest.mock import patch
@@ -330,6 +376,7 @@ class PageRecipeTests(unittest.TestCase):
             enable_unified_memory=False,
             speculative_dflash_draft_kv_ring=False,
             disable_overlap_schedule=True,
+            enable_hierarchical_cache=False,
         )
         with patch(
             "sglang.srt.speculative.dmtp_runtime.cuda_graph_fully_disabled",
@@ -337,6 +384,9 @@ class PageRecipeTests(unittest.TestCase):
         ):
             with get_context().override_server_args(**fields):
                 validate_recipe()
+                with scoped_config(enable_hierarchical_cache=True):
+                    with self.assertRaisesRegex(ValueError, "HiCache"):
+                        validate_recipe()
                 with scoped_config(page_size=1):
                     with self.assertRaises(ValueError):
                         validate_recipe()
@@ -367,6 +417,7 @@ class PageRecipeTests(unittest.TestCase):
             enable_unified_memory=False,
             speculative_dflash_draft_kv_ring=False,
             disable_overlap_schedule=True,
+            enable_hierarchical_cache=False,
         )
         with get_context().override_server_args(**fields):
             with patch(
