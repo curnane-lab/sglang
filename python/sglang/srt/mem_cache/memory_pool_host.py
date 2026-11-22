@@ -63,12 +63,26 @@ elif _is_xpu:
     )
 
 if _is_npu:
-    from sgl_kernel_npu.operators.mem_cache import (
-        transfer_kv_all_layer_kv_split,
-        transfer_kv_all_layer_kv_split_lf_pf,
-        transfer_kv_per_layer_kv_split,
-        transfer_kv_per_layer_kv_split_pf_lf,
-    )
+    try:
+        from sgl_kernel_npu.operators.mem_cache import (
+            transfer_kv_all_layer_kv_split,
+            transfer_kv_all_layer_kv_split_lf_pf,
+            transfer_kv_per_layer_kv_split,
+            transfer_kv_per_layer_kv_split_pf_lf,
+        )
+    except ImportError as e:
+        transfer_kv_all_layer_kv_split = unavailable_stub(
+            "transfer_kv_all_layer_kv_split", str(e)
+        )
+        transfer_kv_all_layer_kv_split_lf_pf = unavailable_stub(
+            "transfer_kv_all_layer_kv_split_lf_pf", str(e)
+        )
+        transfer_kv_per_layer_kv_split = unavailable_stub(
+            "transfer_kv_per_layer_kv_split", str(e)
+        )
+        transfer_kv_per_layer_kv_split_pf_lf = unavailable_stub(
+            "transfer_kv_per_layer_kv_split_pf_lf", str(e)
+        )
 
 logger = logging.getLogger(__name__)
 

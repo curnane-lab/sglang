@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.device_pool_info import MLABufferInfo, MLASplitBuffers
 from sglang.srt.mem_cache.pool_host._kvcacheio import (
     MLA_KVCACHEIO_OPS,
     require_kvcacheio_ops,
+    unavailable_stub,
 )
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
@@ -71,12 +72,26 @@ elif _is_xpu:
         transfer_kv_per_layer_mla_pf_lf,
     )
 if _is_npu:
-    from sgl_kernel_npu.operators.mem_cache import (
-        transfer_kv_all_layer_kv_split,
-        transfer_kv_all_layer_kv_split_lf_pf,
-        transfer_kv_per_layer_kv_split,
-        transfer_kv_per_layer_kv_split_pf_lf,
-    )
+    try:
+        from sgl_kernel_npu.operators.mem_cache import (
+            transfer_kv_all_layer_kv_split,
+            transfer_kv_all_layer_kv_split_lf_pf,
+            transfer_kv_per_layer_kv_split,
+            transfer_kv_per_layer_kv_split_pf_lf,
+        )
+    except ImportError as e:
+        transfer_kv_all_layer_kv_split = unavailable_stub(
+            "transfer_kv_all_layer_kv_split", str(e)
+        )
+        transfer_kv_all_layer_kv_split_lf_pf = unavailable_stub(
+            "transfer_kv_all_layer_kv_split_lf_pf", str(e)
+        )
+        transfer_kv_per_layer_kv_split = unavailable_stub(
+            "transfer_kv_per_layer_kv_split", str(e)
+        )
+        transfer_kv_per_layer_kv_split_pf_lf = unavailable_stub(
+            "transfer_kv_per_layer_kv_split_pf_lf", str(e)
+        )
 
 logger = logging.getLogger(__name__)
 
