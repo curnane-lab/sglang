@@ -7,6 +7,7 @@ from contextlib import ExitStack, contextmanager
 from functools import wraps
 
 from sglang.srt.arg_groups.arg_utils import namespace_of
+from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs
 
@@ -57,6 +58,22 @@ def validate_recipe():
         raise ValueError("DMTP requires FA3 or Ascend draft attention")
     if cfg("quantization") is not None:
         raise ValueError("DMTP requires unquantized weights")
+    if backend == "ascend":
+        if not cuda_graph_fully_disabled() or not cfg("disable_overlap_schedule"):
+            raise ValueError(
+                "Ascend DMTP requires decode/prefill graphs and overlap scheduling "
+                "to be disabled"
+            )
+        graph_flags = (
+            "SGLANG_MTP_PREFIX_MTP_GRAPH",
+            "SGLANG_MTP_PREFIX_TWO_DRAFT_GRAPHS",
+            "SGLANG_MTP_PREFIX_CONDITIONER_GRAPH",
+            "SGLANG_MTP_PREFIX_HEAD_CONDITIONER_GRAPH",
+            "SGLANG_MTP_PREFIX_HEAD_GRAPH",
+            "SGLANG_MTP_PREFIX_ANCHOR_WINDOW_GRAPH",
+        )
+        if any(os.getenv(name, "0") != "0" for name in graph_flags):
+            raise ValueError("Ascend DMTP requires eager execution")
     expected_page_size = 1 if backend == "fa3" else 16
     if cfg("page_size") != expected_page_size:
         raise ValueError(

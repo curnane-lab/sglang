@@ -110,6 +110,12 @@ class NativeSGLangMTP:
     def init_attention_backends(self):
         with scoped_config(**mtp_config(self.owner)):
             self.worker.init_attention_backends()
+        if mtp_config(self.owner)["speculative_draft_attention_backend"] == "ascend":
+            from sglang.srt.speculative.mtp_anchor_ascend import (
+                install_native_ascend_attention,
+            )
+
+            install_native_ascend_attention(self.worker.model_runner.attn_backend)
 
     def init_cuda_graphs(self):
         with scoped_config(**mtp_config(self.owner)):

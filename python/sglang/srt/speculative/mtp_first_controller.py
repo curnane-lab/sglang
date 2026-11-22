@@ -204,6 +204,14 @@ class MTPFirstController:
         info = batch.sampling_info
         if info is None:
             raise ValueError("MTP-first needs explicit sampling info")
+        worker = getattr(self, "worker", None)
+        server_args = getattr(worker, "server_args", None)
+        if (
+            getattr(server_args, "speculative_draft_attention_backend", None)
+            == "ascend"
+            and not info.is_all_greedy
+        ):
+            raise ValueError("Ascend DMTP currently requires temperature=0")
         penalizer = info.penalizer_orchestrator
         if (
             info.need_min_p_sampling

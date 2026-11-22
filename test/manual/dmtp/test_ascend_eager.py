@@ -3,97 +3,122 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.speculative.mtp_anchor_ascend import AnchorAscendForward
+from sglang.srt.speculative.mtp_anchor_ascend import (
+    AnchorAscendForward,
+    AscendDMTPAttention,
+)
 from sglang.srt.speculative.mtp_append_pack import pack_commit, scatter_commit_mapping
 
 
+def run_gathered_attention(*, draft_block, batch, mapping, values, num_queries):
+    values = values.reshape(-1, 1, 1)
+    pool = SimpleNamespace(
+        get_key_buffer=lambda _: torch.zeros_like(values),
+        get_value_buffer=lambda _: values,
+    )
+    backend = SimpleNamespace(
+        token_to_kv_pool=pool,
+        req_to_token_pool=SimpleNamespace(req_to_token=mapping),
+        forward_metadata=SimpleNamespace(swa_out_cache_loc=None),
+        runner_ids=None,
+    )
+    layer = SimpleNamespace(
+        layer_id=0,
+        tp_q_head_num=2,
+        tp_k_head_num=1,
+        tp_v_head_num=1,
+        qk_head_dim=1,
+        v_head_dim=1,
+        scaling=1.0,
+    )
+    attention = AscendDMTPAttention(backend, draft_block=draft_block)
+    return attention(
+        torch.zeros(num_queries, 2), None, None, layer, batch, save_kv_cache=False
+    )
+
+
 class AscendAnchorTests(unittest.TestCase):
-    def test_visible_kv_uses_last_4096_and_current_block(self):
-        class Backend:
-            page_size = 1
-            speculative_num_draft_tokens = 8
-
-            def __init__(self):
-                self.req_to_token = torch.arange(10000).reshape(2, 5000)
-                self.forward_metadata = SimpleNamespace(
-                    block_tables=torch.tensor([[91]]),
-                    seq_lens_cpu_int=torch.tensor([92]),
-                    seq_lens_cpu_list=[92],
-                )
-
-            def forward_mtp(self, *args, **kwargs):
-                metadata = self.forward_metadata
-                self.seen = (
-                    metadata.block_tables.clone(),
-                    metadata.seq_lens_cpu_int.clone(),
-                    list(metadata.seq_lens_cpu_list),
-                )
-                return self.seen
-
-        backend = Backend()
-        adapter = AnchorAscendForward(backend)
-        old_metadata = (
-            backend.forward_metadata.block_tables,
-            backend.forward_metadata.seq_lens_cpu_int,
-            backend.forward_metadata.seq_lens_cpu_list,
-        )
-        blocks = torch.tensor([[8000, 8001, 8002, 8003, 8004, 8005, 8006, 8007],
-                               [9000, 9001, 9002, 9003, 9004, 9005, 9006, 9007]])
-        batch = SimpleNamespace(
-            batch_size=2,
-            seq_lens=torch.tensor([5000, 3]),
-            req_pool_indices=torch.tensor([1, 0]),
-            out_cache_loc=blocks,
-            forward_mode=SimpleNamespace(is_target_verify=lambda: True),
-        )
-        table, device_lengths, host_lengths = adapter(
-            torch.zeros(16, 1), None, None, None, batch, q_descale=torch.ones(1)
-        )
-        self.assertEqual(table.shape, (2, 4104))
-        self.assertEqual(device_lengths.tolist(), [4104, 11])
-        self.assertEqual(host_lengths, [4104, 11])
-        torch.testing.assert_close(table[0, :4096], backend.req_to_token[1, 904:].int())
-        torch.testing.assert_close(table[0, 4096:], blocks[0].int())
-        torch.testing.assert_close(table[1, :3], backend.req_to_token[0, :3].int())
-        torch.testing.assert_close(table[1, 3:11], blocks[1].int())
-        self.assertEqual(torch.count_nonzero(table[1, 11:]).item(), 0)
-        self.assertIs(backend.forward_metadata.block_tables, old_metadata[0])
-        self.assertIs(backend.forward_metadata.seq_lens_cpu_int, old_metadata[1])
-        self.assertIs(backend.forward_metadata.seq_lens_cpu_list, old_metadata[2])
-
-        backend.page_size = 16
-        adapter = AnchorAscendForward(backend)
-        table, device_lengths, host_lengths = adapter(
-            torch.zeros(16, 1), None, None, None, batch, q_descale=torch.ones(1)
-        )
-        self.assertEqual(table.shape, (2, 258))
-        self.assertEqual(device_lengths.tolist(), [4104, 11])
-        self.assertEqual(host_lengths, [4104, 11])
-        torch.testing.assert_close(table[0, :256], torch.arange(369, 625).int())
-        self.assertEqual(table[0, 256].item(), 500)
-        self.assertEqual(table[1, :2].tolist(), [0, 562])
-        self.assertEqual(torch.count_nonzero(table[0, 257:]).item(), 0)
-        self.assertEqual(torch.count_nonzero(table[1, 2:]).item(), 0)
-
-    def test_page16_unaligned_anchor_window_has_capacity(self):
+    def test_visible_slots_keep_unaligned_window_and_all_block_addresses(self):
+        mapping = torch.arange(24000).reshape(4, 6000) + 10000
         backend = SimpleNamespace(
             page_size=16,
             speculative_num_draft_tokens=8,
             forward_mtp=None,
-            req_to_token=torch.arange(5000).reshape(1, 5000),
+            req_to_token_pool=SimpleNamespace(req_to_token=mapping),
         )
         adapter = AnchorAscendForward(backend)
+        prefixes = [4097, 4105, 5000, 3]
+        blocks = torch.tensor(
+            [
+                [8000, 8001, 8002, 8003, 8004, 8005, 8006, 8007],
+                [9000, 9001, 9002, 9003, 9004, 9005, 9006, 9007],
+                [10000, 10001, 10002, 10003, 10004, 10005, 10006, 10007],
+                [11000, 11001, 11002, 11003, 11004, 11005, 11006, 11007],
+            ]
+        )
+        batch = SimpleNamespace(
+            batch_size=4,
+            seq_lens=torch.tensor(prefixes),
+            req_pool_indices=torch.tensor([0, 1, 2, 3]),
+            out_cache_loc=blocks,
+        )
+        visible = adapter._visible_slots(batch)
+        for req, prefix in enumerate(prefixes):
+            expected = torch.cat(
+                (mapping[req, max(0, prefix - 4096) : prefix], blocks[req])
+            )
+            torch.testing.assert_close(visible[req], expected)
+            torch.testing.assert_close(visible[req][-8:], blocks[req])
+
+    def test_draft_gather_reads_all_current_block_rows(self):
+        prefix = 4105
+        mapping = torch.arange(4113).reshape(1, -1)
+        blocks = torch.arange(prefix, prefix + 8)
         batch = SimpleNamespace(
             batch_size=1,
-            seq_lens=torch.tensor([5000]),
+            seq_lens=torch.tensor([prefix]),
             req_pool_indices=torch.tensor([0]),
-            out_cache_loc=torch.arange(8000, 8008),
+            out_cache_loc=blocks,
         )
-        table, lengths = adapter._visible_kv(batch)
-        self.assertEqual(table.shape, (1, 258))
-        self.assertEqual(lengths, [4104])
-        torch.testing.assert_close(table[0, :257], torch.arange(56, 313).int())
-        self.assertEqual(table[0, 257].item(), 500)
+        values = torch.full((4113,), 50000.0)
+        values[torch.cat((mapping[0, prefix - 4096 : prefix], blocks))] = 1.0
+        out = run_gathered_attention(
+            draft_block=True,
+            batch=batch,
+            mapping=mapping,
+            values=values,
+            num_queries=8,
+        )
+        torch.testing.assert_close(out, torch.ones(8, 2))
+
+    def test_native_mtp_reads_shifted_mapping_with_causal_mask(self):
+        batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([1, 0]),
+            extend_prefix_lens_cpu=[2, 1],
+            extend_seq_lens_cpu=[2, 1],
+        )
+        out = run_gathered_attention(
+            draft_block=False,
+            batch=batch,
+            mapping=torch.tensor([[8, 2, 0, 0], [6, 0, 3, 7]]),
+            values=torch.arange(10, dtype=torch.float32),
+            num_queries=3,
+        )
+        torch.testing.assert_close(
+            out, torch.tensor([3.0, 4.0, 5.0])[:, None].expand(-1, 2)
+        )
+
+    def test_ascend_rejects_non_greedy_requests(self):
+        from sglang.srt.speculative.mtp_first_controller import MTPFirstController
+
+        controller = MTPFirstController.__new__(MTPFirstController)
+        controller.worker = SimpleNamespace(
+            server_args=SimpleNamespace(speculative_draft_attention_backend="ascend")
+        )
+        with self.assertRaisesRegex(ValueError, "temperature=0"):
+            controller.validate_sampling(
+                SimpleNamespace(sampling_info=SimpleNamespace(is_all_greedy=False))
+            )
 
     def test_controller_does_not_materialize_dense_mask(self):
         from sglang.srt.speculative.mtp_first_controller import MTPFirstController
@@ -241,9 +266,56 @@ class NativeKVLayoutTests(unittest.TestCase):
         controller.alloc_hidden_cache()
         self.assertEqual(controller.target_hidden_cache.shape, (65568, 1))
 
+    def test_gathered_write_preserves_physical_window_locations(self):
+        values = torch.zeros(16, 1, 1)
+        writes = []
+        pool = SimpleNamespace(
+            get_key_buffer=lambda _: torch.zeros_like(values),
+            get_value_buffer=lambda _: values,
+            set_kv_buffer=lambda *args: writes.append(args),
+        )
+        backend = SimpleNamespace(
+            token_to_kv_pool=pool,
+            req_to_token_pool=SimpleNamespace(req_to_token=torch.tensor([[3]])),
+            forward_metadata=SimpleNamespace(
+                swa_out_cache_loc=torch.tensor([3])
+            ),
+            runner_ids=SimpleNamespace(window_storage="window"),
+        )
+        layer = SimpleNamespace(
+            layer_id=0,
+            tp_q_head_num=2,
+            tp_k_head_num=1,
+            tp_v_head_num=1,
+            qk_head_dim=1,
+            v_head_dim=1,
+            scaling=1.0,
+        )
+        batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([0]),
+            extend_prefix_lens_cpu=[0],
+            extend_seq_lens_cpu=[1],
+            out_cache_loc=torch.tensor([3]),
+            out_cache_loc_is_physical=True,
+        )
+        attention = AscendDMTPAttention(backend, draft_block=False)
+        attention(
+            torch.zeros(1, 2),
+            torch.zeros(1, 1),
+            torch.zeros(1, 1),
+            layer,
+            batch,
+        )
+        _, write, _, _ = writes[0]
+        self.assertTrue(write.physical)
+        self.assertEqual(write.loc.tolist(), [3])
+        self.assertEqual(write.window_locs["window"].tolist(), [3])
+
 
 class PageRecipeTests(unittest.TestCase):
     def test_ascend_uses_page16_and_fa3_keeps_page1(self):
+        from unittest.mock import patch
+
         from sglang.srt.runtime_context import get_context
         from sglang.srt.speculative.dmtp_runtime import scoped_config, validate_recipe
 
@@ -257,16 +329,60 @@ class PageRecipeTests(unittest.TestCase):
             enable_two_batch_overlap=False,
             enable_unified_memory=False,
             speculative_dflash_draft_kv_ring=False,
+            disable_overlap_schedule=True,
+        )
+        with patch(
+            "sglang.srt.speculative.dmtp_runtime.cuda_graph_fully_disabled",
+            return_value=True,
+        ):
+            with get_context().override_server_args(**fields):
+                validate_recipe()
+                with scoped_config(page_size=1):
+                    with self.assertRaises(ValueError):
+                        validate_recipe()
+                with scoped_config(
+                    speculative_draft_attention_backend="fa3", page_size=1
+                ):
+                    validate_recipe()
+                with scoped_config(
+                    speculative_draft_attention_backend="fa3", page_size=16
+                ):
+                    with self.assertRaises(ValueError):
+                        validate_recipe()
+
+    def test_ascend_rejects_graphs_overlap_and_graph_flags(self):
+        from unittest.mock import patch
+
+        from sglang.srt.runtime_context import get_context
+        from sglang.srt.speculative.dmtp_runtime import validate_recipe
+
+        fields = dict(
+            page_size=16,
+            quantization=None,
+            speculative_num_draft_tokens=8,
+            speculative_draft_attention_backend="ascend",
+            max_running_requests=1,
+            enable_lora=False,
+            enable_two_batch_overlap=False,
+            enable_unified_memory=False,
+            speculative_dflash_draft_kv_ring=False,
+            disable_overlap_schedule=True,
         )
         with get_context().override_server_args(**fields):
-            validate_recipe()
-            with scoped_config(page_size=1):
-                with self.assertRaises(ValueError):
+            with patch(
+                "sglang.srt.speculative.dmtp_runtime.cuda_graph_fully_disabled",
+                return_value=False,
+            ):
+                with self.assertRaisesRegex(ValueError, "graphs"):
                     validate_recipe()
-            with scoped_config(speculative_draft_attention_backend="fa3", page_size=1):
-                validate_recipe()
-            with scoped_config(speculative_draft_attention_backend="fa3", page_size=16):
-                with self.assertRaises(ValueError):
+            with (
+                patch(
+                    "sglang.srt.speculative.dmtp_runtime.cuda_graph_fully_disabled",
+                    return_value=True,
+                ),
+                patch.dict("os.environ", {"SGLANG_MTP_PREFIX_MTP_GRAPH": "1"}),
+            ):
+                with self.assertRaisesRegex(ValueError, "eager"):
                     validate_recipe()
 
 
