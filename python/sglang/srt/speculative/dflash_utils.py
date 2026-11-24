@@ -1266,11 +1266,23 @@ def build_speculative_verify_target_probs(
 def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
-    if (
-        os.getenv("SGLANG_DMTP_T1_RESIDUAL", "0") == "1"
-        and get_spec().speculative_draft_attention_backend == "ascend"
-        and req.sampling_params.top_k != 1
-    ):
-        return "Ascend DMTP requires greedy sampling (top_k=1 or temperature=0)."
+    if os.getenv("SGLANG_DMTP_T1_RESIDUAL", "0") == "1":
+        unsupported = []
+        if req.return_logprob:
+            unsupported.append("logprobs")
+        if req.grammar is not None or any(
+            getattr(req.sampling_params, name, None) is not None
+            for name in ("json_schema", "regex", "ebnf", "structural_tag")
+        ):
+            unsupported.append("grammar")
+        if req.sampling_params.logit_bias is not None:
+            unsupported.append("logit_bias")
+        if unsupported:
+            return f"DMTP does not support {', '.join(unsupported)}."
+        if (
+            get_spec().speculative_draft_attention_backend == "ascend"
+            and req.sampling_params.top_k != 1
+        ):
+            return "Ascend DMTP requires greedy sampling (top_k=1 or temperature=0)."
 
     return None

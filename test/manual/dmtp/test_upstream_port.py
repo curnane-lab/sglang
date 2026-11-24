@@ -120,6 +120,7 @@ class PortTest(unittest.TestCase):
             enable_two_batch_overlap=False,
             enable_unified_memory=False,
             speculative_dflash_draft_kv_ring=False,
+            disaggregation_mode="null",
         )
         with get_context().override_server_args(**fields):
             validate_recipe()
@@ -131,6 +132,8 @@ class PortTest(unittest.TestCase):
                 ("enable_two_batch_overlap", True),
                 ("enable_unified_memory", True),
                 ("speculative_dflash_draft_kv_ring", True),
+                ("disaggregation_mode", "prefill"),
+                ("disaggregation_mode", "decode"),
             ):
                 with scoped_config(**{name: value}):
                     with self.assertRaises(ValueError):

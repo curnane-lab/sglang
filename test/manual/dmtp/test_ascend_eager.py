@@ -266,6 +266,27 @@ class NativeKVLayoutTests(unittest.TestCase):
         controller.alloc_hidden_cache()
         self.assertEqual(controller.target_hidden_cache.shape, (65568, 1))
 
+    def test_fia_token_rows_do_not_multiply_hidden_cache_capacity(self):
+        from sglang.srt.speculative.mtp_first_controller import MTPFirstController
+
+        keys = torch.empty(64, 1, 1, 1)
+        pool = SimpleNamespace(
+            start_layer=0,
+            get_kv_buffer=lambda layer: (keys, torch.empty_like(keys)),
+        )
+        controller = MTPFirstController.__new__(MTPFirstController)
+        controller.final_buffer = torch.empty(4, 1)
+        controller.native = SimpleNamespace(
+            worker=SimpleNamespace(
+                model_runner=SimpleNamespace(token_to_kv_pool=pool)
+            )
+        )
+        controller.worker = SimpleNamespace(
+            server_args=SimpleNamespace(page_size=16)
+        )
+        controller.alloc_hidden_cache()
+        self.assertEqual(controller.target_hidden_cache.shape, (64, 1))
+
     def test_gathered_write_preserves_physical_window_locations(self):
         values = torch.zeros(16, 1, 1)
         writes = []
@@ -313,15 +334,29 @@ class NativeKVLayoutTests(unittest.TestCase):
 
 
 class RequestAdmissionTests(unittest.TestCase):
+    @staticmethod
+    def make_request():
+        return SimpleNamespace(
+            return_hidden_states=False,
+            return_logprob=False,
+            grammar=None,
+            sampling_params=SimpleNamespace(
+                top_k=1,
+                logit_bias=None,
+                json_schema=None,
+                regex=None,
+                ebnf=None,
+                structural_tag=None,
+            ),
+        )
+
     def test_non_greedy_is_rejected_before_worker_and_greedy_is_allowed(self):
         from unittest.mock import patch
 
         from sglang.srt.speculative.dflash_utils import validate_dflash_request
 
-        request = SimpleNamespace(
-            return_hidden_states=False,
-            sampling_params=SimpleNamespace(top_k=1 << 30),
-        )
+        request = self.make_request()
+        request.sampling_params.top_k = 1 << 30
         spec = SimpleNamespace(speculative_draft_attention_backend="ascend")
         with (
             patch.dict("os.environ", {"SGLANG_DMTP_T1_RESIDUAL": "1"}),
@@ -338,6 +373,40 @@ class RequestAdmissionTests(unittest.TestCase):
                 )
             spec.speculative_draft_attention_backend = "fa3"
             self.assertIsNone(validate_dflash_request(request, enable_overlap=False))
+
+    def test_dmtp_rejects_logprobs_grammar_and_logit_bias_before_worker(self):
+        from unittest.mock import patch
+
+        from sglang.srt.speculative.dflash_utils import validate_dflash_request
+
+        cases = (
+            ("logprobs", "return_logprob", True),
+            ("grammar", "grammar", object()),
+            ("grammar", "json_schema", "{}"),
+            ("grammar", "regex", ".*"),
+            ("grammar", "ebnf", "root ::= 'x'"),
+            ("grammar", "structural_tag", "{}"),
+            ("logit_bias", "logit_bias", {"1": 1.0}),
+        )
+        spec = SimpleNamespace(speculative_draft_attention_backend="ascend")
+        with (
+            patch.dict("os.environ", {"SGLANG_DMTP_T1_RESIDUAL": "1"}),
+            patch("sglang.srt.speculative.dflash_utils.get_spec", return_value=spec),
+        ):
+            for expected, field, value in cases:
+                with self.subTest(field=field):
+                    request = self.make_request()
+                    target = (
+                        request
+                        if field in ("return_logprob", "grammar")
+                        else request.sampling_params
+                    )
+                    setattr(target, field, value)
+                    error = validate_dflash_request(request, enable_overlap=False)
+                    self.assertIn(expected, error)
+            self.assertIsNone(
+                validate_dflash_request(self.make_request(), enable_overlap=False)
+            )
 
     def test_rejected_request_is_retired_without_entering_scheduler_queue(self):
         from http import HTTPStatus

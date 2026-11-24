@@ -8,7 +8,7 @@ from pathlib import Path
 import torch
 
 from sglang.srt.speculative.mtp_prefix_mask import build_full_prefix_mask
-from sglang.srt.speculative.native_sglang_mtp import NativeSGLangMTP
+from sglang.srt.speculative.native_sglang_mtp import NativeSGLangMTP, _kv_token_rows
 
 
 @dataclass
@@ -190,10 +190,8 @@ class MTPFirstController:
 
     def alloc_hidden_cache(self):
         pool = self.native.worker.model_runner.token_to_kv_pool
-        rows = (
-            pool.get_key_buffer(pool.start_layer).shape[0]
-            * self.worker.server_args.page_size
-        )
+        keys, _ = _kv_token_rows(pool, self.worker.server_args.page_size)
+        rows = keys.shape[0]
         self.target_hidden_cache = torch.empty(
             (rows, self.final_buffer.shape[1]),
             device=self.final_buffer.device,

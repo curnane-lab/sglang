@@ -53,6 +53,8 @@ def validate_recipe():
     ):
         if cfg(name):
             raise ValueError(f"DMTP does not support {name}")
+    if (cfg("disaggregation_mode") or "null") != "null":
+        raise ValueError("DMTP does not support P/D disaggregation")
     backend = cfg("speculative_draft_attention_backend")
     if backend not in ("fa3", "ascend"):
         raise ValueError("DMTP requires FA3 or Ascend draft attention")
