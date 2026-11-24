@@ -1277,6 +1277,8 @@ def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
             unsupported.append("grammar")
         if req.sampling_params.logit_bias is not None:
             unsupported.append("logit_bias")
+        if req.sampling_params.min_p > 0:
+            unsupported.append("min_p")
         if unsupported:
             return f"DMTP does not support {', '.join(unsupported)}."
         if (

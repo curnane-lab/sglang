@@ -342,6 +342,7 @@ class RequestAdmissionTests(unittest.TestCase):
             grammar=None,
             sampling_params=SimpleNamespace(
                 top_k=1,
+                min_p=0.0,
                 logit_bias=None,
                 json_schema=None,
                 regex=None,
@@ -374,7 +375,7 @@ class RequestAdmissionTests(unittest.TestCase):
             spec.speculative_draft_attention_backend = "fa3"
             self.assertIsNone(validate_dflash_request(request, enable_overlap=False))
 
-    def test_dmtp_rejects_logprobs_grammar_and_logit_bias_before_worker(self):
+    def test_dmtp_rejects_unsupported_sampling_options_before_worker(self):
         from unittest.mock import patch
 
         from sglang.srt.speculative.dflash_utils import validate_dflash_request
@@ -387,6 +388,7 @@ class RequestAdmissionTests(unittest.TestCase):
             ("grammar", "ebnf", "root ::= 'x'"),
             ("grammar", "structural_tag", "{}"),
             ("logit_bias", "logit_bias", {"1": 1.0}),
+            ("min_p", "min_p", 0.1),
         )
         spec = SimpleNamespace(speculative_draft_attention_backend="ascend")
         with (
